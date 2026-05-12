@@ -180,6 +180,12 @@ pub trait Backend: Send + Sync {
     /// Default false: quant weight tensors stay host-resident.
     fn uploads_quant_weights(&self) -> bool { false }
 
+    /// Number of untimed warmup forward passes the bench should run after the
+    /// first-forward measurement and before the timed decode loop.
+    /// GPU backends that need DVFS ramp-up time return a non-zero value here
+    /// so the budget-capped timed steps all land in steady state.
+    fn decode_warmup_steps(&self) -> usize { 0 }
+
     /// Fused dequantize+matmul for quantized weight matrices.
     ///
     /// `x` is f32 [..., K]. `w` is a weight Tensor with dtype Q4_K/Q6_K/etc

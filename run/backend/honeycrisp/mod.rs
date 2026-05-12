@@ -646,6 +646,8 @@ impl Backend for HoneycrispBackend {
 
     fn uploads_quant_weights(&self) -> bool { true }
 
+    fn decode_warmup_steps(&self) -> usize { 3 }
+
     fn supports_gpu_attention(&self) -> bool { true }
 
     fn reset_gpu_kv_cache(&self) {

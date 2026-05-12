@@ -112,6 +112,15 @@ pub fn bench_e2e(
     let _ = model.forward(0, backend).map_err(|e| format!("{e}"))?;
     let first_forward_ms = t_first.elapsed().as_secs_f64() * 1000.0;
 
+    // Untimed warmup steps for backends that need DVFS ramp-up (e.g. Metal GPU).
+    // These run after first_forward so kernels are compiled, but before the timed
+    // loop so all measured steps land in steady state.
+    let warmup = backend.decode_warmup_steps();
+    for i in 0..warmup {
+        let tok = (i % 100) as u32;
+        let _ = model.forward(tok, backend).map_err(|e| format!("{e}"))?;
+    }
+
     // Cap subsequent steps to fit within budget.
     let actual_steps = if first_forward_ms > 0.0 && budget_secs.is_finite() {
         let budget_ms = budget_secs * 1000.0;
