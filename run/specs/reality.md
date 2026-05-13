@@ -34,7 +34,7 @@ qwen3-0.6b passes HF per-op activation golden regression (tier3_goldens).
 | qwen3-0.6b-abl | qwen3 | LLM | ✓ works | — |
 | gemma-4-31b | gemma4 | LLM | ✓ works | — |
 | deepseek-r1-8b-abl | qwen3 | LLM | loads, quality unknown | needs verify |
-| nuextract-1.5 | phi3 | LLM | err | tensor naming mismatch |
+| nuextract-0.5 | phi3 | LLM | err | tensor naming mismatch |
 | smollm2-360m | llama | LLM | err | tensor naming mismatch |
 | bitnet-2b | bitnet | LLM | loads, quality unknown | needs verify |
 | mimo-7b-rl | mimo | LLM | err | Q8 dtype gap |
