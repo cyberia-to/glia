@@ -482,40 +482,68 @@ print('\n'.join(lines))
         let w = &weights.weights[*tname];
         let hf_name = import::naming::gguf_to_hf(tname);
 
-        // Canonical alignment: every tensor goes source → f32 → canonical encoding.
-        // Source dtype is irrelevant to the *output* layout; only the canonical
-        // policy (by tensor name) decides what the bytes look like on disk.
-        let f32s = import::dequantize_to_f32(&w.data, w.dtype);
-        if f32s.is_empty() {
-            eprintln!("warn: {tname} dequant returned empty (dtype {:?})", w.dtype);
-            continue;
-        }
+        // K-quant pass-through / re-encoding strategy:
+        // - Q4_K source + weight matrix + 256-aligned K → write raw bytes as "q4k" (zero-copy)
+        // - Q6_K / Q5_K / Q3_K / Q2_K source + weight matrix + 256-aligned K →
+        //   dequant→f32→re-quantize as Q4K so the whole model is dtype-uniform.
+        //   Uniform dtype is required for the fused SIMD decode path.
+        // - Everything else → canonical dequant+re-encode policy.
+        let is_kquant_weight = import::naming::canonical_encoding_for(&hf_name) == "q8"
+            && w.shape.len() >= 2
+            && w.shape[w.shape.len() - 1] % 256 == 0;
+        let (written_enc, canonical_bytes): (&'static str, Vec<u8>) =
+            if w.dtype == import::DType::Q4_K && is_kquant_weight && w.data.len() % 144 == 0 {
+                // GGUF bytes are already in [N, K] row-major layout (loader reverses dims, not bytes).
+                ("q4k", w.data.clone())
+            } else if matches!(w.dtype,
+                    import::DType::Q6_K | import::DType::Q5_K |
+                    import::DType::Q3_K | import::DType::Q2_K)
+                && is_kquant_weight
+            {
+                // Re-encode as Q4K for uniform dtype.
+                let f32s = import::dequantize_to_f32(&w.data, w.dtype);
+                if f32s.is_empty() {
+                    eprintln!("warn: {tname} dequant returned empty (dtype {:?})", w.dtype);
+                    continue;
+                }
+                let n = w.shape[0];
+                let k = w.shape[w.shape.len() - 1];
+                ("q4k", import::quant::f32_to_q4k(&f32s, n, k))
+            } else {
+                // Default: dequant to f32 → re-encode with canonical policy.
+                let f32s = import::dequantize_to_f32(&w.data, w.dtype);
+                if f32s.is_empty() {
+                    eprintln!("warn: {tname} dequant returned empty (dtype {:?})", w.dtype);
+                    continue;
+                }
 
-        let encoding = import::naming::canonical_encoding_for(&hf_name);
-        // q4/q8/ternary require length % 32 == 0. Tensors whose element
-        // count isn't aligned (e.g. gemma-4's per-layer scalar) fall back
-        // to u32, which has no block-size constraint.
-        let needs_block = matches!(encoding, "q4" | "q8" | "ternary");
-        let written_enc: &'static str = if needs_block && f32s.len() % 32 != 0 {
-            eprintln!(
-                "warn: {hf_name} has {} elements, not a multiple of 32 — falling back to u32",
-                f32s.len()
-            );
-            "u32"
-        } else {
-            encoding
-        };
-        let canonical_bytes: Vec<u8> = match written_enc {
-            "u32" => import::quant::canonical::f32_to_u32(&f32s),
-            "u16" => import::quant::canonical::f32_to_u16(&f32s),
-            "q4" => import::quant::canonical::f32_to_q4(&f32s),
-            "q8" => import::quant::canonical::f32_to_q8(&f32s),
-            "ternary" => import::quant::canonical::f32_to_ternary(&f32s),
-            other => {
-                eprintln!("warn: unknown canonical encoding {other} for {hf_name}; using u32");
-                import::quant::canonical::f32_to_u32(&f32s)
-            }
-        };
+                let encoding = import::naming::canonical_encoding_for(&hf_name);
+                // q4/q8/ternary require length % 32 == 0. Tensors whose element
+                // count isn't aligned (e.g. gemma-4's per-layer scalar) fall back
+                // to u32, which has no block-size constraint.
+                let needs_block = matches!(encoding, "q4" | "q8" | "ternary");
+                let enc: &'static str = if needs_block && f32s.len() % 32 != 0 {
+                    eprintln!(
+                        "warn: {hf_name} has {} elements, not a multiple of 32 — falling back to u32",
+                        f32s.len()
+                    );
+                    "u32"
+                } else {
+                    encoding
+                };
+                let bytes: Vec<u8> = match enc {
+                    "u32" => import::quant::canonical::f32_to_u32(&f32s),
+                    "u16" => import::quant::canonical::f32_to_u16(&f32s),
+                    "q4" => import::quant::canonical::f32_to_q4(&f32s),
+                    "q8" => import::quant::canonical::f32_to_q8(&f32s),
+                    "ternary" => import::quant::canonical::f32_to_ternary(&f32s),
+                    other => {
+                        eprintln!("warn: unknown canonical encoding {other} for {hf_name}; using u32");
+                        import::quant::canonical::f32_to_u32(&f32s)
+                    }
+                };
+                (enc, bytes)
+            };
         counts_by_enc.entry(written_enc).and_modify(|c| *c += 1).or_insert(1);
 
         let size = canonical_bytes.len();
