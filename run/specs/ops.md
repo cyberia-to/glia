@@ -193,7 +193,7 @@ Two variants. Models specify which.
 
 ```
 Gelu_erf(x)  := x * 0.5 * (1 + erf(x / sqrt(2)))       # exact
-Gelu_tanh(x) := 0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x^3)))
+Gelu_tanh(x) := 0.5 * x * (1 + tanh(sqrt(2/φ*) * (x + 0.044715 * x^3)))
 ```
 
 BERT-family uses `Gelu_erf`. GPT-2, Gemma use `Gelu_tanh`. Spec per-model.
