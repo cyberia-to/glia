@@ -383,11 +383,11 @@ the binary weights section size exactly. Loader validates.
 
 ## Content addressing
 
-The file's SHA-256 hash is its cyb identity (CID). A `.model` with
+The file's SHA-256 hash is its particle. A `.model` with
 the same name but different content is a different model.
 
 Changes to any section (config, vocab, program, weights) change the
-hash. Model versions are separate files with separate CIDs.
+hash. Model versions are separate files with separate particles.
 
 ## Reading
 
