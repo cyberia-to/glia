@@ -137,6 +137,11 @@ pub struct HoneycrispBackend {
     pipe_scale: HcPipeline,
     pipe_q4: HcPipeline,
     pipe_q4k: HcPipeline,
+    /// SIMD-parallel Q4K kernels for the fused decode path.
+    pipe_q4k_nrm:      HcPipeline,  // NRM + Q4K matmul (q_proj, o_proj)
+    pipe_q4k_dual_nrm: HcPipeline,  // NRM + dual Q4K matmul (k+v proj)
+    pipe_q4k_gus_nrm:  HcPipeline,  // NRM + Q4K gate+up + SwiGLU
+    pipe_q4k_large:    HcPipeline,  // Q4K matmul, no NRM (o_proj, down_proj)
     pipe_q6k: HcPipeline,
     pipe_q8: HcPipeline,
     pipe_add: HcPipeline,
@@ -182,6 +187,9 @@ pub struct HoneycrispBackend {
     /// the no-cache LARGE path, which causes excessive L2 traffic at high n_rows.
     pipe_q8_nrm_mb64:        HcPipeline,
     pipe_q8_dual_nrm_mb64:   HcPipeline,
+    /// Bias-fused variants: add bias[row] at output, eliminating separate pipe_add dispatches.
+    pipe_q8_nrm_mb64_bias:      HcPipeline,
+    pipe_q8_dual_nrm_mb64_bias: HcPipeline,
     pipe_q8_gus_nrm_mb64:    HcPipeline,
     /// MB48 gate+up+silu+norm: 6 KB TG memory vs 8 KB → 5 TGs/core (vs 4) → 200 concurrent TGs.
     /// Only safe when n_blk_kd ≤ 48 (e.g. qwen2.5-coder hidden=1536, 48 blocks).
@@ -256,6 +264,10 @@ impl HoneycrispBackend {
         let pipe_silu = HcPipeline(device.pipeline(kernels::silu::MSL)?);
         let pipe_scale = HcPipeline(device.pipeline(kernels::silu::MSL_SCALE)?);
         let pipe_q4k = HcPipeline(device.pipeline(kernels::q4k_matmul::MSL)?);
+        let pipe_q4k_nrm      = HcPipeline(device.pipeline(kernels::q4k_matmul::MSL_NRM)?);
+        let pipe_q4k_dual_nrm = HcPipeline(device.pipeline(kernels::q4k_matmul::MSL_DUAL_NRM)?);
+        let pipe_q4k_gus_nrm  = HcPipeline(device.pipeline(kernels::q4k_matmul::MSL_GUS_NRM)?);
+        let pipe_q4k_large    = HcPipeline(device.pipeline(kernels::q4k_matmul::MSL_LARGE)?);
         let pipe_q6k = HcPipeline(device.pipeline(kernels::q6k_matmul::MSL)?);
         let pipe_q8 = HcPipeline(device.pipeline(&kernels::q8_matmul::msl())?);
         let pipe_q4 = HcPipeline(device.pipeline(&kernels::q4_matmul::msl())?);
@@ -296,6 +308,8 @@ impl HoneycrispBackend {
         let pipe_q8_large_res     = HcPipeline(device.pipeline(kernels::q8_matmul::MSL_LARGE_RES)?);
         let pipe_q8_nrm_mb64        = HcPipeline(device.pipeline(&kernels::q8_matmul::msl_nrm_mb(64))?);
         let pipe_q8_dual_nrm_mb64   = HcPipeline(device.pipeline(&kernels::q8_matmul::msl_dual_nrm_mb(64))?);
+        let pipe_q8_nrm_mb64_bias      = HcPipeline(device.pipeline(&kernels::q8_matmul::msl_nrm_mb_bias(64))?);
+        let pipe_q8_dual_nrm_mb64_bias = HcPipeline(device.pipeline(&kernels::q8_matmul::msl_dual_nrm_mb_bias(64))?);
         let pipe_q8_gus_nrm_mb64    = HcPipeline(device.pipeline(&kernels::q8_matmul::msl_gus_nrm_mb(64))?);
         let pipe_q8_gus_nrm_mb48    = HcPipeline(device.pipeline(&kernels::q8_matmul::msl_gus_nrm_mb(48))?);
         let pipe_q8_gus_nrm_mb64_r4 = HcPipeline(device.pipeline(kernels::q8_matmul::MSL_GUS_NRM_MB64_R4)?);
@@ -325,6 +339,10 @@ impl HoneycrispBackend {
             pipe_scale,
             pipe_q4,
             pipe_q4k,
+            pipe_q4k_nrm,
+            pipe_q4k_dual_nrm,
+            pipe_q4k_gus_nrm,
+            pipe_q4k_large,
             pipe_q6k,
             pipe_q8,
             pipe_add,
@@ -363,6 +381,8 @@ impl HoneycrispBackend {
             pipe_q8_large_res,
             pipe_q8_nrm_mb64,
             pipe_q8_dual_nrm_mb64,
+            pipe_q8_nrm_mb64_bias,
+            pipe_q8_dual_nrm_mb64_bias,
             pipe_q8_gus_nrm_mb64,
             pipe_q8_gus_nrm_mb48,
             pipe_q8_gus_nrm_mb64_r4,
@@ -1833,7 +1853,7 @@ impl Backend for HoneycrispBackend {
 
         let l0 = &layers[0];
         let kind = l0.q_proj.dtype;
-        if !matches!(kind, DType::Q4 | DType::Q8) { return Ok(None); }
+        if !matches!(kind, DType::Q4 | DType::Q8 | DType::Q4_K) { return Ok(None); }
         let has_qk_norm      = l0.q_norm.is_some();
         let has_post_attn_n  = l0.post_attn_norm.is_some();
         let has_post_ffw_n   = l0.post_ffw_norm.is_some();
@@ -1841,27 +1861,34 @@ impl Backend for HoneycrispBackend {
         let has_qkv_bias = layers.iter().any(|l|
             l.q_bias.is_some() || l.k_bias.is_some() || l.v_bias.is_some());
 
-        // GeluTanh + post norms require Q8 large-kd path (no Q4 variant yet).
-        if use_gelu_tanh && kind == DType::Q4 { return Ok(None); }
+        // GeluTanh + post norms require Q8 large-kd path (no Q4/Q4K variant yet).
+        if use_gelu_tanh && kind != DType::Q8 { return Ok(None); }
+        // Q4K: no qk_norm/post-norm variants yet.
+        if kind == DType::Q4_K && (has_qk_norm || has_post_attn_n || has_post_ffw_n) { return Ok(None); }
 
+        let is_q4k = kind == DType::Q4_K;
         let block_size = match kind {
             DType::Q4 => kernels::q4_matmul::BLOCK_SIZE,
             DType::Q8 => kernels::q8_matmul::BLOCK_SIZE,
+            DType::Q4_K => 256,
             _ => unreachable!(),
         };
         let simds = match kind {
             DType::Q4 => kernels::q4_matmul::SIMDS_PER_GROUP,
             DType::Q8 => kernels::q8_matmul::SIMDS_PER_GROUP,
+            DType::Q4_K => kernels::q4k_matmul::SIMDS_PER_GROUP,
             _ => unreachable!(),
         };
         let n_dst = match kind {
             DType::Q4 => kernels::q4_matmul::N_DST,
             DType::Q8 => kernels::q8_matmul::N_DST,
+            DType::Q4_K => 1,
             _ => unreachable!(),
         };
         let pipe_q = match kind {
             DType::Q4 => &self.pipe_q4.0,
             DType::Q8 => &self.pipe_q8.0,
+            DType::Q4_K => &self.pipe_q4k.0,  // simple per-row (generic execute path)
             _ => unreachable!(),
         };
 
@@ -1897,8 +1924,8 @@ impl Backend for HoneycrispBackend {
             // post_attn_norm / post_ffw_norm must be GPU-resident
             if let Some(n) = l.post_attn_norm { if !on_gpu(n) { return Ok(None); } }
             if let Some(n) = l.post_ffw_norm  { if !on_gpu(n) { return Ok(None); } }
-            // Q4 large-kd (n_blk_kd > 64): LARGE4_NRM/GUS_NRM not yet implemented for Q4.
-            if !has_qk_norm && kind == DType::Q4 && k_dim / block_size > 64 { return Ok(None); }
+            // Q4 large-kd (n_blk_kd > 64): LARGE4_NRM/GUS_NRM not yet implemented for Q4/Q4K.
+            if !has_qk_norm && (kind == DType::Q4 || is_q4k) && k_dim / block_size > 64 { return Ok(None); }
         }
         if k_dim % block_size != 0 || inter_size % block_size != 0 { return Ok(None); }
 
@@ -2070,56 +2097,48 @@ impl Backend for HoneycrispBackend {
         // Pipeline references (disjoint borrows from self — OK with batch_raw)
         let pipe_rmsnorm   = &self.pipe_rmsnorm.0;
         let _pipe_rope_ref  = &self.pipe_rope.0;
+        // Note: Q4K dispatch branches on is_q4k and uses pipe_q4k_* directly;
+        // the following Q4/Q8-only pipes are never reached for Q4K.
         let pipe_q_dual    = match kind {
             DType::Q4 => &self.pipe_q4_dual.0,
-            DType::Q8 => &self.pipe_q8_dual.0,
-            _ => unreachable!(),
+            DType::Q8 | _ => &self.pipe_q8_dual.0,
         };
         let pipe_q_gus     = match kind {
             DType::Q4 => &self.pipe_q4_gus.0,
-            DType::Q8 => &self.pipe_q8_gus.0,
-            _ => unreachable!(),
+            DType::Q8 | _ => &self.pipe_q8_gus.0,
         };
         // Sized-MAX_BLOCKS variants — used in fused dispatch for better occupancy.
         let pipe_q_opt     = match kind {
             DType::Q4 => &self.pipe_q4_mb32.0,
-            DType::Q8 => &self.pipe_q8_mb32.0,
-            _ => unreachable!(),
+            DType::Q8 | _ => &self.pipe_q8_mb32.0,
         };
         let pipe_q_dual_opt = match kind {
             DType::Q4 => &self.pipe_q4_dual_mb32.0,
-            DType::Q8 => &self.pipe_q8_dual_mb32.0,
-            _ => unreachable!(),
+            DType::Q8 | _ => &self.pipe_q8_dual_mb32.0,
         };
         let pipe_q_gus_opt = match kind {
             DType::Q4 => &self.pipe_q4_gus_mb32.0,
-            DType::Q8 => &self.pipe_q8_gus_mb32.0,
-            _ => unreachable!(),
+            DType::Q8 | _ => &self.pipe_q8_gus_mb32.0,
         };
         let pipe_q_gus_nrm = match kind {
             DType::Q4 => &self.pipe_q4_gus_nrm_mb32.0,
-            DType::Q8 => &self.pipe_q8_gus_nrm_mb32.0,
-            _ => unreachable!(),
+            DType::Q8 | _ => &self.pipe_q8_gus_nrm_mb32.0,
         };
         let pipe_q_nrm = match kind {
             DType::Q4 => &self.pipe_q4_nrm_mb32.0,
-            DType::Q8 => &self.pipe_q8_nrm_mb32.0,
-            _ => unreachable!(),
+            DType::Q8 | _ => &self.pipe_q8_nrm_mb32.0,
         };
         let pipe_q_dual_nrm = match kind {
             DType::Q4 => &self.pipe_q4_dual_nrm_mb32.0,
-            DType::Q8 => &self.pipe_q8_dual_nrm_mb32.0,
-            _ => unreachable!(),
+            DType::Q8 | _ => &self.pipe_q8_dual_nrm_mb32.0,
         };
         let pipe_q_res_o   = match kind {
             DType::Q4 => &self.pipe_q4_res_mb64.0,
-            DType::Q8 => &self.pipe_q8_res_mb64.0,
-            _ => unreachable!(),
+            DType::Q8 | _ => &self.pipe_q8_res_mb64.0,
         };
         let pipe_q_res_d   = match kind {
             DType::Q4 => &self.pipe_q4_res_mb96.0,
-            DType::Q8 => &self.pipe_q8_res_mb96.0,
-            _ => unreachable!(),
+            DType::Q8 | _ => &self.pipe_q8_res_mb96.0,
         };
         let pipe_kv_both                = &st.pipe_kv_append_both.0;
         let pipe_rope_kv_attn           = &st.pipe_rope_kv_attn.0;
@@ -2142,6 +2161,10 @@ impl Backend for HoneycrispBackend {
         let pipe_q8_large16t_res   = &self.pipe_q8_large16t_res.0;
         let pipe_q8_nrm_mb64        = &self.pipe_q8_nrm_mb64.0;
         let pipe_q8_dual_nrm_mb64   = &self.pipe_q8_dual_nrm_mb64.0;
+        let pipe_q8_nrm_mb64_bias      = &self.pipe_q8_nrm_mb64_bias.0;
+        let pipe_q8_dual_nrm_mb64_bias = &self.pipe_q8_dual_nrm_mb64_bias.0;
+        // Fuse qkv bias into matmul when Q8+mb64: -3 dispatches + -1 barrier per layer.
+        let q8_mb64_bias = use_mb64_kd && kind == DType::Q8 && has_qkv_bias;
         let pipe_q8_gus_nrm_mb64    = &self.pipe_q8_gus_nrm_mb64.0;
         let pipe_q8_gus_nrm_mb48    = &self.pipe_q8_gus_nrm_mb48.0;
         let pipe_q8_gus_nrm_mb64_r4 = &self.pipe_q8_gus_nrm_mb64_r4.0;
@@ -2152,6 +2175,11 @@ impl Backend for HoneycrispBackend {
         let pipe_q4_large_res       = &self.pipe_q4_large_res.0;
         let pipe_add                = &self.pipe_add.0;
         let pipe_scale              = &self.pipe_scale.0;
+        // Q4K SIMD-parallel kernels for the fused decode path.
+        let pipe_q4k_nrm      = &self.pipe_q4k_nrm.0;
+        let pipe_q4k_dual_nrm = &self.pipe_q4k_dual_nrm.0;
+        let pipe_q4k_gus_nrm  = &self.pipe_q4k_gus_nrm.0;
+        let pipe_q4k_large    = &self.pipe_q4k_large.0;
         let _pipe_qkv       = match kind {
             DType::Q4 => &self.pipe_q4_qkv.0,
             DType::Q8 => &self.pipe_q8_qkv.0,
@@ -2196,10 +2224,13 @@ impl Backend for HoneycrispBackend {
                             #[repr(C)] #[derive(Clone,Copy)]
                             struct D { batch: u32, n_rows: u32, n_blocks: u32, eps: f32 }
                             let d = D { batch: 1, n_rows, n_blocks: n_blk_kd, eps };
-                            let (pipe, rows_per_tg) = if use_large_kd {
+                            let (pipe, rows_per_tg) = if is_q4k {
+                                (pipe_q4k_nrm, simds * n_dst)
+                            } else if use_large_kd {
                                 (pipe_q8_large4_nrm, simds * 4)
                             } else if use_mb64_kd {
                                 let p = match kind {
+                                    DType::Q8 if q8_mb64_bias => pipe_q8_nrm_mb64_bias,
                                     DType::Q8 => pipe_q8_nrm_mb64,
                                     DType::Q4 => pipe_q4_nrm_mb64,
                                     _ => unreachable!(),
@@ -2215,6 +2246,9 @@ impl Backend for HoneycrispBackend {
                             enc.bind_buffer(&*lp.q_w, 0, 2);
                             enc.bind_buffer(&q_raw, 0, 3);
                             push_bytes!(enc, d, 4);
+                            if q8_mb64_bias && !lp.q_b.is_null() {
+                                enc.bind_buffer(&*lp.q_b, 0, 5);
+                            }
                             enc.launch_groups((groups as usize, 1, 1), (tpg as usize, 1, 1));
                         }
                         // 3. K+V with inline input_norm
@@ -2248,8 +2282,11 @@ impl Backend for HoneycrispBackend {
                             #[repr(C)] #[derive(Clone,Copy)]
                             struct D { batch: u32, n_rows: u32, n_blocks: u32, eps: f32 }
                             let d = D { batch: 1, n_rows, n_blocks: n_blk_kd, eps };
-                            let pipe = if use_mb64_kd {
+                            let pipe = if is_q4k {
+                                pipe_q4k_dual_nrm
+                            } else if use_mb64_kd {
                                 match kind {
+                                    DType::Q8 if q8_mb64_bias => pipe_q8_dual_nrm_mb64_bias,
                                     DType::Q8 => pipe_q8_dual_nrm_mb64,
                                     DType::Q4 => pipe_q4_dual_nrm_mb64,
                                     _ => unreachable!(),
@@ -2263,6 +2300,10 @@ impl Backend for HoneycrispBackend {
                             enc.bind_buffer(&k_raw, 0, 4);
                             enc.bind_buffer(&v_raw, 0, 5);
                             push_bytes!(enc, d, 6);
+                            if q8_mb64_bias {
+                                if !lp.k_b.is_null() { enc.bind_buffer(&*lp.k_b, 0, 7); }
+                                if !lp.v_b.is_null() { enc.bind_buffer(&*lp.v_b, 0, 8); }
+                            }
                             enc.launch_groups((groups as usize, 1, 1), (tpg as usize, 1, 1));
                         }
                         // Fused matmul + residual add: y[row] = matmul(x, w)[row] + residual[row].
@@ -2298,8 +2339,9 @@ impl Backend for HoneycrispBackend {
                         enc.memory_barrier_buffers();
 
                         // Optional QKV bias addition (Qwen2-style attn_bias).
-                        // In-place: q_raw[i] += q_bias[i], same for k and v.
-                        if has_qkv_bias {
+                        // When q8_mb64_bias: bias is already fused into the matmul kernels above.
+                        // Fallback path for non-mb64 or Q4 paths.
+                        if has_qkv_bias && !q8_mb64_bias {
                             macro_rules! add_bias_inplace {
                                 ($buf:expr, $bias_ptr:expr, $n:expr) => {
                                     if !$bias_ptr.is_null() {
@@ -2404,7 +2446,37 @@ impl Backend for HoneycrispBackend {
                         // Without post_attn_norm: fused matmul+residual → hid2.
                         // With post_attn_norm: plain matmul → rmsnorm → add_residual.
                         if lp.post_attn_n.is_null() {
-                            if use_large_qd {
+                            if is_q4k {
+                                // Q4K: plain matmul → barrier → residual add
+                                {
+                                    let n_rows = lp.o_n_rows;
+                                    let rows_per_tg = simds;
+                                    let groups = (n_rows + rows_per_tg - 1) / rows_per_tg;
+                                    let tpg = simds * 32;
+                                    #[repr(C)] #[derive(Clone,Copy)]
+                                    struct D { batch: u32, n_rows: u32, n_blocks: u32, pad: u32 }
+                                    let d = D { batch: 1, n_rows, n_blocks: n_blk_qd, pad: 0 };
+                                    enc.bind(pipe_q4k_large);
+                                    enc.bind_buffer(&attn, 0, 0);
+                                    enc.bind_buffer(&*lp.o_w, 0, 1);
+                                    enc.bind_buffer(&hid2, 0, 2);
+                                    push_bytes!(enc, d, 3);
+                                    enc.launch_groups((groups as usize, 1, 1), (tpg as usize, 1, 1));
+                                }
+                                enc.memory_barrier_buffers();
+                                {
+                                    let n = k_dim as u32;
+                                    #[repr(C)] #[derive(Clone,Copy)]
+                                    struct P { n: u32, a_len: u32, b_len: u32, pad: u32 }
+                                    let p = P { n, a_len: n, b_len: n, pad: 0 };
+                                    enc.bind(pipe_add);
+                                    enc.bind_buffer(&hid2, 0, 0);
+                                    enc.bind_buffer(hidden_in, 0, 1);
+                                    enc.bind_buffer(&hid2, 0, 2);
+                                    push_bytes!(enc, p, 3);
+                                    enc.launch_groups((((n + 255) / 256) as usize, 1, 1), (256, 1, 1));
+                                }
+                            } else if use_large_qd {
                                 let p = match kind {
                                     DType::Q8 => pipe_q8_large4_res,
                                     DType::Q4 => pipe_q4_large_res,
@@ -2470,7 +2542,9 @@ impl Backend for HoneycrispBackend {
                             #[repr(C)] #[derive(Clone,Copy)]
                             struct D { batch: u32, n_rows: u32, n_blocks: u32, eps: f32 }
                             let d = D { batch: 1, n_rows, n_blocks: n_blk_kd, eps };
-                            let (pipe, rows_per_tg) = if use_large_kd {
+                            let (pipe, rows_per_tg) = if is_q4k {
+                                (pipe_q4k_gus_nrm, simds * n_dst)
+                            } else if use_large_kd {
                                 let p = if use_gelu_tanh { pipe_q8_large4_gus_nrm_gelu } else { pipe_q8_large4_gus_nrm };
                                 (p, simds * 4)
                             } else if use_mb64_kd {
@@ -2507,7 +2581,37 @@ impl Backend for HoneycrispBackend {
 
                         // down_proj + optional post_ffw_norm + residual.
                         if lp.post_ffw_n.is_null() {
-                            if use_large_inter {
+                            if is_q4k {
+                                // Q4K: plain matmul → barrier → residual add
+                                {
+                                    let n_rows = lp.dn_n_rows;
+                                    let rows_per_tg = simds;
+                                    let groups = (n_rows + rows_per_tg - 1) / rows_per_tg;
+                                    let tpg = simds * 32;
+                                    #[repr(C)] #[derive(Clone,Copy)]
+                                    struct D { batch: u32, n_rows: u32, n_blocks: u32, pad: u32 }
+                                    let d = D { batch: 1, n_rows, n_blocks: n_blk_inter, pad: 0 };
+                                    enc.bind(pipe_q4k_large);
+                                    enc.bind_buffer(&mid, 0, 0);
+                                    enc.bind_buffer(&*lp.down_w, 0, 1);
+                                    enc.bind_buffer(hidden_out, 0, 2);
+                                    push_bytes!(enc, d, 3);
+                                    enc.launch_groups((groups as usize, 1, 1), (tpg as usize, 1, 1));
+                                }
+                                enc.memory_barrier_buffers();
+                                {
+                                    let n = k_dim as u32;
+                                    #[repr(C)] #[derive(Clone,Copy)]
+                                    struct P { n: u32, a_len: u32, b_len: u32, pad: u32 }
+                                    let p = P { n, a_len: n, b_len: n, pad: 0 };
+                                    enc.bind(pipe_add);
+                                    enc.bind_buffer(hidden_out, 0, 0);
+                                    enc.bind_buffer(&hid2, 0, 1);
+                                    enc.bind_buffer(hidden_out, 0, 2);
+                                    push_bytes!(enc, p, 3);
+                                    enc.launch_groups((((n + 255) / 256) as usize, 1, 1), (256, 1, 1));
+                                }
+                            } else if use_large_inter {
                                 let p = match kind {
                                     DType::Q8 => pipe_q8_large4_res,
                                     DType::Q4 => pipe_q4_large_res,
