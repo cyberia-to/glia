@@ -2182,13 +2182,11 @@ impl Backend for HoneycrispBackend {
         let pipe_q4k_large    = &self.pipe_q4k_large.0;
         let _pipe_qkv       = match kind {
             DType::Q4 => &self.pipe_q4_qkv.0,
-            DType::Q8 => &self.pipe_q8_qkv.0,
-            _ => unreachable!(),
+            DType::Q8 | _ => &self.pipe_q8_qkv.0,  // Q4K never uses this path
         };
         let _pipe_q_res     = match kind {
             DType::Q4 => &self.pipe_q4_res.0,
-            DType::Q8 => &self.pipe_q8_res.0,
-            _ => unreachable!(),
+            DType::Q8 | _ => &self.pipe_q8_res.0,  // Q4K never uses this path
         };
 
         unsafe {
