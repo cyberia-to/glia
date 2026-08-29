@@ -697,7 +697,7 @@ impl Backend for HoneycrispBackend {
         let q4 = matches!(o_proj_w.dtype, DType::Q4);
         let on_gpu = matches!(o_proj_w.data, TensorData::Backend(_));
         if !(q8 || q4) || !on_gpu || hidden_in.dtype != DType::F32 {
-            return Backend::fused_attn_oproj_residual(
+            return crate::backend::fallback_fused_attn_oproj_residual(
                 self, q, k, v, hidden_in, o_proj_w,
                 layer_idx, position,
                 num_heads, kv_heads, head_dim, max_seq, scale, window,
@@ -1328,7 +1328,7 @@ impl Backend for HoneycrispBackend {
             || hidden.dtype != DType::F32 || input_norm_gamma.dtype != DType::F32
             || q_norm_gamma.dtype != DType::F32 || k_norm_gamma.dtype != DType::F32
         {
-            return Backend::fused_norm_qkv_qknorm(
+            return crate::backend::fallback_fused_norm_qkv_qknorm(
                 self, hidden, input_norm_gamma,
                 q_proj_w, k_proj_w, v_proj_w,
                 q_norm_gamma, k_norm_gamma,
@@ -1510,7 +1510,7 @@ impl Backend for HoneycrispBackend {
         if !weights_q8 || !weights_on_gpu || !k_match || !aligned
             || hidden.dtype != DType::F32 || post_norm_gamma.dtype != DType::F32
         {
-            return Backend::fused_norm_swiglu_down(
+            return crate::backend::fallback_fused_norm_swiglu_down(
                 self, hidden, post_norm_gamma, gate_w, up_w, down_w, eps,
             );
         }
@@ -1662,7 +1662,7 @@ impl Backend for HoneycrispBackend {
         if !q_ok || !on_gpu || hidden_in.dtype != DType::F32
             || post_norm_gamma.dtype != DType::F32
         {
-            return Backend::fused_ffn_residual(
+            return crate::backend::fallback_fused_ffn_residual(
                 self, hidden_in, post_norm_gamma, gate_w, up_w, down_w, eps,
             );
         }
@@ -1703,7 +1703,7 @@ impl Backend for HoneycrispBackend {
         if (gate_w.shape[1] as u32) != d || (up_w.shape[1] as u32) != d
             || (down_w.shape[1] as u32) != inter
         {
-            return Backend::fused_ffn_residual(self, hidden_in, post_norm_gamma, gate_w, up_w, down_w, eps);
+            return crate::backend::fallback_fused_ffn_residual(self, hidden_in, post_norm_gamma, gate_w, up_w, down_w, eps);
         }
 
         let h_buf = self.buf_ref(hidden_in)?;
@@ -2740,7 +2740,7 @@ impl Backend for HoneycrispBackend {
         // All inputs must be f32 (host or backend). If any quantized, fall back.
         let supported = pairs.iter().all(|(x, g)| x.dtype == DType::F32 && g.dtype == DType::F32);
         if !supported {
-            return Backend::rms_norm_multi(self, pairs, eps);
+            return crate::backend::fallback_rms_norm_multi(self, pairs, eps);
         }
 
         // Resolve buf refs and allocate outputs.
@@ -2819,7 +2819,7 @@ impl Backend for HoneycrispBackend {
         });
         let weights_on_gpu = ws.iter().all(|w| matches!(w.data, TensorData::Backend(_)));
         if !supported || !weights_on_gpu || x.dtype != DType::F32 || gamma.dtype != DType::F32 {
-            return Backend::fused_norm_quant_matmul_multi(self, x, gamma, eps, ws);
+            return crate::backend::fallback_fused_norm_quant_matmul_multi(self, x, gamma, eps, ws);
         }
 
         let batch = x.shape[..x.shape.len() - 1].iter().product::<usize>() as u32;
