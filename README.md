@@ -74,4 +74,4 @@ glia (run model)      →  inference outputs (features, activations)
 mir (render)          →  R-1.0 world
 ```
 
-see [[stack]]
+see [[status]]
