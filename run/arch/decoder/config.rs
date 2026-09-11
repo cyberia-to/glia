@@ -86,6 +86,16 @@ pub struct LlamaConfig {
     /// Runtime code reads `family.*` fields instead of matching on the
     /// string — see `families/` for the per-family profiles.
     pub family: FamilyProfile,
+
+    // ── GatedDeltaNet dims (Qwen3.5/3.8/3-Next) ──
+    // Spec: run/specs/ops.md §"GatedDeltaNet". `None` unless
+    // `layer_types` contains at least one `LinearAttn` — plain
+    // LlamaStyle/LlamaStyle+ models never populate these.
+    pub linear_num_value_heads: Option<usize>,
+    pub linear_num_key_heads: Option<usize>,
+    pub linear_key_head_dim: Option<usize>,
+    pub linear_value_head_dim: Option<usize>,
+    pub linear_conv_kernel_dim: Option<usize>,
 }
 
 impl LlamaConfig {
@@ -369,6 +379,26 @@ impl LlamaConfig {
             .and_then(|v| v.as_integer())
             .map(|i| i as usize);
         let family = FamilyProfile::for_model_type(&model_type, query_pre_attn_scalar);
+        let linear_num_value_heads = arch
+            .get("linear_num_value_heads")
+            .and_then(|v| v.as_integer())
+            .map(|i| i as usize);
+        let linear_num_key_heads = arch
+            .get("linear_num_key_heads")
+            .and_then(|v| v.as_integer())
+            .map(|i| i as usize);
+        let linear_key_head_dim = arch
+            .get("linear_key_head_dim")
+            .and_then(|v| v.as_integer())
+            .map(|i| i as usize);
+        let linear_value_head_dim = arch
+            .get("linear_value_head_dim")
+            .and_then(|v| v.as_integer())
+            .map(|i| i as usize);
+        let linear_conv_kernel_dim = arch
+            .get("linear_conv_kernel_dim")
+            .and_then(|v| v.as_integer())
+            .map(|i| i as usize);
 
         Ok(Self {
             model_type,
@@ -397,6 +427,11 @@ impl LlamaConfig {
             partial_rotary_factor_full,
             query_pre_attn_scalar,
             family,
+            linear_num_value_heads,
+            linear_num_key_heads,
+            linear_key_head_dim,
+            linear_value_head_dim,
+            linear_conv_kernel_dim,
         })
     }
 }

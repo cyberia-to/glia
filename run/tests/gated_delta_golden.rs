@@ -103,7 +103,8 @@ fn gated_delta_matches_hf_reference_on_real_weights() {
         out_proj: &out_proj,
     };
 
-    let ours = gated_delta_forward(&x, &weights, dims, 1e-6).expect("forward");
+    let mut state = vec![0f32; dims.num_v_heads * dims.head_k_dim * dims.head_v_dim];
+    let ours = gated_delta_forward(&x, &weights, dims, 1e-6, &mut state).expect("forward");
     let (hf_shape, hf_data) = read_dump(&PathBuf::from(DIR).join("output.bin"));
     assert_eq!(ours.shape, hf_shape, "output shape mismatch");
 

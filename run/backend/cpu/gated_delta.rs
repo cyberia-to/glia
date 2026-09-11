@@ -51,11 +51,22 @@ impl GatedDeltaDims {
 }
 
 /// `x`: `[T, hidden]`. Returns `[T, hidden]`.
+///
+/// `state`: the `[num_v_heads, head_k_dim, head_v_dim]` recurrent state,
+/// owned by the caller and mutated in place — same pattern as this
+/// crate's own `kv: &mut (Vec<f32>, Vec<f32>)` for Sdpa layers, except
+/// fixed-size rather than append-only (ops.md's "KV-cache analogue"
+/// note). Zero it once per fresh conversation (same moment
+/// `reset_kv_cache` zeroes the Sdpa cache); every call after that reads
+/// and updates it — there is no separate "prefill" mode, a run of T>1
+/// calls with the same buffer is mathematically identical to T separate
+/// calls of length 1 each (the recurrence has no lookahead).
 pub fn gated_delta_forward(
     x: &Tensor,
     w: &GatedDeltaWeights,
     dims: GatedDeltaDims,
     eps: f32,
+    state: &mut [f32],
 ) -> Result<Tensor, BackendError> {
     if x.rank() != 2 {
         return Err(BackendError::ShapeMismatch {
@@ -143,8 +154,15 @@ pub fn gated_delta_forward(
     }
 
     // 6. Sequential recurrence — the delta rule. One [hk, hv] state
-    //    matrix per head, decayed and rank-1-updated every token.
-    let mut state = vec![0f32; h * hk * hv];
+    //    matrix per head, decayed and rank-1-updated every token, carried
+    //    in the caller-owned `state` buffer across calls.
+    if state.len() != h * hk * hv {
+        return Err(BackendError::ShapeMismatch {
+            op: "GatedDeltaNet",
+            expected: vec![h, hk, hv],
+            got: vec![state.len()],
+        });
+    }
     let mut out = vec![0f32; t * h * hv]; // [T, num_v_heads, head_v_dim], pre out_proj
     for ti in 0..t {
         for hi in 0..h {

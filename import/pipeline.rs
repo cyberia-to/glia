@@ -222,6 +222,15 @@ pub fn import_snapshot(
     let sliding_window = text_config["sliding_window"].as_u64();
     let global_head_dim = text_config["global_head_dim"].as_u64();
     let num_global_key_value_heads = text_config["num_global_key_value_heads"].as_u64();
+    // GatedDeltaNet dims (Qwen3.5/3.8/3-Next "linear_attention" layers).
+    // Spec: run/specs/ops.md §"GatedDeltaNet". Present only when the model
+    // actually has linear_attention layers; omitted otherwise so plain
+    // LlamaStyle/LlamaStyle+ config stays exactly as clean as before.
+    let linear_num_value_heads = text_config["linear_num_value_heads"].as_u64();
+    let linear_num_key_heads = text_config["linear_num_key_heads"].as_u64();
+    let linear_key_head_dim = text_config["linear_key_head_dim"].as_u64();
+    let linear_value_head_dim = text_config["linear_value_head_dim"].as_u64();
+    let linear_conv_kernel_dim = text_config["linear_conv_kernel_dim"].as_u64();
     let layer_types: Vec<String> = text_config["layer_types"]
         .as_array()
         .map(|a| {
@@ -277,6 +286,21 @@ pub fn import_snapshot(
     }
     if let Some(rt_full) = rope_theta_full {
         llamaplus.push_str(&format!("rope_theta_full = {rt_full}\n"));
+    }
+    if let Some(nvh) = linear_num_value_heads {
+        llamaplus.push_str(&format!("linear_num_value_heads = {nvh}\n"));
+    }
+    if let Some(nkh) = linear_num_key_heads {
+        llamaplus.push_str(&format!("linear_num_key_heads = {nkh}\n"));
+    }
+    if let Some(kd) = linear_key_head_dim {
+        llamaplus.push_str(&format!("linear_key_head_dim = {kd}\n"));
+    }
+    if let Some(vd) = linear_value_head_dim {
+        llamaplus.push_str(&format!("linear_value_head_dim = {vd}\n"));
+    }
+    if let Some(ck) = linear_conv_kernel_dim {
+        llamaplus.push_str(&format!("linear_conv_kernel_dim = {ck}\n"));
     }
     if let Some(prf) = partial_rotary_factor_full {
         llamaplus.push_str(&format!("partial_rotary_factor_full = {prf}\n"));

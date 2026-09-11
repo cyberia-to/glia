@@ -56,6 +56,31 @@ pub struct LayerWeights {
     pub post_ffw_norm: Option<Tensor>,
     /// Gemma-4: per-channel scale applied to the residual layer output.
     pub layer_output_scale: Option<Tensor>,
+    /// `Some` exactly when `config.layer_types[i] == LinearAttn` — this
+    /// layer's `self_attn.*` fields above are unset placeholders (the
+    /// tensors don't exist in the source at all) and `forward_layer`
+    /// must branch to `backend::cpu::gated_delta` before touching them.
+    pub linear_attn: Option<GatedDeltaLayerWeights>,
+}
+
+/// GatedDeltaNet layer weights (`linear_attn.*`, spec: ops.md
+/// §"GatedDeltaNet"). The five big projections stay quantized, same as
+/// every other matmul weight in this file; the four small ones (two
+/// [num_v_heads] gate params, the conv kernel, the gate norm) are
+/// dequantized at load like the norm weights are.
+pub struct GatedDeltaLayerWeights {
+    pub in_proj_qkv: QuantWeight,
+    pub in_proj_z: QuantWeight,
+    pub in_proj_b: QuantWeight,
+    pub in_proj_a: QuantWeight,
+    pub out_proj: QuantWeight,
+    /// `[conv_dim, kernel_size]` — declared `[conv_dim, 1, kernel_size]`
+    /// in the source (PyTorch depthwise Conv1d's own layout); reshaped
+    /// at load, same bytes.
+    pub conv1d_weight: Tensor,
+    pub a_log: Tensor,
+    pub dt_bias: Tensor,
+    pub norm_weight: Tensor,
 }
 
 pub struct Weights {
@@ -118,6 +143,7 @@ impl Weights {
         for i in 0..config.num_hidden_layers {
             let q_dim = config.num_attention_heads * config.layer_head_dim(i);
             let kv_dim = config.layer_kv_heads(i) * config.layer_head_dim(i);
+            let kind = config.layer_types.get(i).copied().unwrap_or(super::config::LayerKind::Sliding);
             let mut layer = load_layer(
                 lm,
                 i,
@@ -125,6 +151,8 @@ impl Weights {
                 q_dim,
                 kv_dim,
                 intermediate_size,
+                kind,
+                config,
             )?;
             if norm_offset {
                 offset_norm_by_one(&mut layer.input_norm);
@@ -255,6 +283,8 @@ fn load_layer(
     q_dim: usize,
     kv_dim: usize,
     intermediate: usize,
+    kind: super::config::LayerKind,
+    config: &LlamaConfig,
 ) -> Result<LayerWeights, FormatError> {
     let prefix = format!("model.layers.{i}");
     let try_load_f32 = |name: &str| -> Option<Tensor> {
@@ -271,6 +301,72 @@ fn load_layer(
     let quant_nk = |name: &str, n: usize, k: usize| -> Result<QuantWeight, FormatError> {
         load_quant_weight_reshaped(lm, &format!("{prefix}.{name}"), vec![n, k])
     };
+
+    // GatedDeltaNet layers (spec: ops.md §"GatedDeltaNet") carry
+    // `linear_attn.*` instead of `self_attn.*` — those tensors do not
+    // exist in the source at all for this layer. Load that branch
+    // entirely, and fill q/k/v/o_proj with zero-size placeholders that
+    // `forward_layer` guarantees are never read (it branches to
+    // `backend::cpu::gated_delta` before reaching any Sdpa code for a
+    // `LinearAttn` layer — see that dispatch's own comment).
+    if kind == super::config::LayerKind::LinearAttn {
+        let placeholder = || QuantWeight {
+            shape: vec![0, 0],
+            dtype: crate::core::dtype::DType::F32,
+            bytes: Arc::new(Vec::new()),
+            tensor: Tensor::from_f32(vec![0, 0], Vec::new()),
+        };
+        let need = |name: &str, v: Option<usize>| -> Result<usize, FormatError> {
+            v.ok_or_else(|| {
+                FormatError::Invalid(format!(
+                    "layer {i} is linear_attention but config has no {name} \
+                     (import didn't carry the GatedDeltaNet dims — re-import \
+                     with a build that writes them, see ops.md §GatedDeltaNet)"
+                ))
+            })
+        };
+        let num_v_heads = need("linear_num_value_heads", config.linear_num_value_heads)?;
+        let num_k_heads = need("linear_num_key_heads", config.linear_num_key_heads)?;
+        let head_k_dim = need("linear_key_head_dim", config.linear_key_head_dim)?;
+        let head_v_dim = need("linear_value_head_dim", config.linear_value_head_dim)?;
+        let conv_kernel_dim = need("linear_conv_kernel_dim", config.linear_conv_kernel_dim)?;
+        let key_dim = num_k_heads * head_k_dim;
+        let value_dim = num_v_heads * head_v_dim;
+        return Ok(LayerWeights {
+            input_norm: must_f32("input_layernorm.weight")?,
+            q_proj: placeholder(),
+            k_proj: placeholder(),
+            v_proj: placeholder(),
+            o_proj: placeholder(),
+            q_proj_bias: None,
+            k_proj_bias: None,
+            v_proj_bias: None,
+            q_norm: None,
+            k_norm: None,
+            post_norm: must_f32("post_attention_layernorm.weight")?,
+            gate_proj: quant_nk("mlp.gate_proj.weight", intermediate, hidden)?,
+            up_proj: quant_nk("mlp.up_proj.weight", intermediate, hidden)?,
+            down_proj: quant_nk("mlp.down_proj.weight", hidden, intermediate)?,
+            post_attn_norm: try_load_f32("post_attention_norm.weight"),
+            post_ffw_norm: try_load_f32("post_ffw_norm.weight"),
+            layer_output_scale: try_load_f32("layer_output_scale.weight"),
+            linear_attn: Some(GatedDeltaLayerWeights {
+                in_proj_qkv: quant_nk("linear_attn.in_proj_qkv.weight", key_dim * 2 + value_dim, hidden)?,
+                in_proj_z: quant_nk("linear_attn.in_proj_z.weight", value_dim, hidden)?,
+                in_proj_b: quant_nk("linear_attn.in_proj_b.weight", num_v_heads, hidden)?,
+                in_proj_a: quant_nk("linear_attn.in_proj_a.weight", num_v_heads, hidden)?,
+                out_proj: quant_nk("linear_attn.out_proj.weight", hidden, value_dim)?,
+                conv1d_weight: load_tensor_f32_reshaped(
+                    lm,
+                    &format!("{prefix}.linear_attn.conv1d.weight"),
+                    vec![key_dim * 2 + value_dim, conv_kernel_dim],
+                )?,
+                a_log: must_f32("linear_attn.A_log")?,
+                dt_bias: must_f32("linear_attn.dt_bias")?,
+                norm_weight: must_f32("linear_attn.norm.weight")?,
+            }),
+        });
+    }
 
     let q_proj  = quant_nk("self_attn.q_proj.weight", q_dim, hidden)?;
     let k_proj  = quant_nk("self_attn.k_proj.weight", kv_dim, hidden)?;
@@ -317,5 +413,6 @@ fn load_layer(
         post_attn_norm: try_load_f32("post_attention_norm.weight"),
         post_ffw_norm: try_load_f32("post_ffw_norm.weight"),
         layer_output_scale: try_load_f32("layer_output_scale.weight"),
+        linear_attn: None,
     })
 }

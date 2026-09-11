@@ -32,8 +32,50 @@ pub struct ModelFile {
     pub vocab_toml: String,
     pub chat_toml: String,
     pub eval_toml: String,
-    /// Binary weights section — may be mmap-backed for large models.
-    pub weights: Vec<u8>,
+    /// Binary weights section — mmap-backed for large models, owned bytes
+    /// for small ones. `Weights::load` reads every tensor's bytes out of
+    /// this exactly once (into its own `QuantWeight`/`Tensor`), so this
+    /// itself staying zero-copy means a large model's weights section
+    /// never has to exist twice in RAM at once during load — see
+    /// `run/specs/gated-delta-vl-plan.md`, "import itself OOMs" (the same
+    /// failure mode, found again here on the runtime's own load path).
+    pub weights: WeightBytes,
+}
+
+/// Either owned bytes (small models, or the frontmatter-only text scan
+/// already covered the whole weights section) or an mmap kept alive for
+/// the file's lifetime (large models) — `get()` hides the difference.
+pub enum WeightBytes {
+    Owned(Vec<u8>),
+    Mapped {
+        mmap: memmap2::Mmap,
+        /// Byte offset within `mmap` where the weights section begins;
+        /// every `TensorMeta::offset` is relative to THIS, not to the
+        /// start of the file.
+        weights_start: usize,
+    },
+}
+
+impl WeightBytes {
+    pub fn get(&self, range: std::ops::Range<usize>) -> Option<&[u8]> {
+        match self {
+            WeightBytes::Owned(v) => v.get(range),
+            WeightBytes::Mapped { mmap, weights_start } => {
+                mmap.get(weights_start + range.start..weights_start + range.end)
+            }
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        match self {
+            WeightBytes::Owned(v) => v.len(),
+            WeightBytes::Mapped { mmap, weights_start } => mmap.len().saturating_sub(*weights_start),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 /// Per-tensor metadata from the tensors section.
@@ -92,20 +134,24 @@ pub fn read_model_file(path: &Path) -> Result<ModelFile, FormatError> {
     // Parse ~~~sections
     let sections = parse_sections(text_part);
 
-    // Read weights section.
+    // Read weights section. Large files: keep the mmap itself, never copy
+    // the weights blob out whole — a 27B model's ~30 GB packed weights
+    // existed twice at once here (this Vec, then again distributed across
+    // every tensor's own QuantWeight bytes) and peaked at OOM on a 48 GB
+    // Mac before generation ever started. `WeightBytes::get` makes the
+    // two branches look identical to every caller.
     let weights_start = marker_pos + marker.len();
     let weights_end = (weights_start + weights_size).min(file_len);
     let weights = if file_len > 1_000_000_000 {
-        // mmap for large files
         drop(reader);
         let mmap = unsafe { memmap2::Mmap::map(&file)? };
-        mmap[weights_start..weights_end].to_vec()
+        WeightBytes::Mapped { mmap, weights_start }
     } else if weights_end <= header.len() {
-        header[weights_start..weights_end].to_vec()
+        WeightBytes::Owned(header[weights_start..weights_end].to_vec())
     } else {
         drop(reader);
         let data = std::fs::read(path)?;
-        data[weights_start..weights_end].to_vec()
+        WeightBytes::Owned(data[weights_start..weights_end].to_vec())
     };
 
     // Decode the optional hex-encoded graph section.

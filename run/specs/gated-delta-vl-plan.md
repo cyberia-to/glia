@@ -182,6 +182,87 @@ Not done — genuinely still open:
   design (ops.md's own "CPU reference first" convention); a
   chunked/parallel kernel for speed is unstarted.
 
+## Progress (2026-09-11, continued — wired into forward_layer)
+
+Landed on top of the Progress section above:
+
+- **Two more prerequisite bugs found and fixed, both pre-existing and
+  general** (not GatedDeltaNet-specific, but blocked it from loading at
+  all): (1) `import/naming.rs`'s `gguf_to_hf` never stripped the
+  `model.language_model.` prefix VL checkpoints use — every tensor
+  lookup in `run/arch/decoder/weights.rs` hardcodes the shorter
+  `model.layers.N.*` LlamaStyle convention, so even this model's plain
+  Full-attention layers would have failed to load. (2) The importer
+  never carried `linear_num_value_heads`/`linear_num_key_heads`/
+  `linear_key_head_dim`/`linear_value_head_dim`/`linear_conv_kernel_dim`
+  into the packed config at all — added to both `import/pipeline.rs`
+  (write) and `run/arch/decoder/config.rs` (read). Re-imported 27B
+  after each fix; both confirmed in the actual packed `.model` file.
+- **`gated_delta_forward` wired into `forward_layer`**: `LayerWeights`
+  gained a `linear_attn: Option<GatedDeltaLayerWeights>` field (the
+  five big projections stay quantized — `QuantWeight`, same as every
+  other matmul weight; the four small ones dequant at load like norms
+  do); `load_layer` branches on `LayerKind` and fills `self_attn.*`
+  fields with inert zero-size placeholders for `LinearAttn` layers
+  (never read — `forward_layer` branches before touching them).
+  `forward_layer` itself now computes `hidden1` via one of two paths
+  (GatedDeltaNet or the original Sdpa block) that both feed the SAME
+  shared FFN epilogue unchanged — norm→attention→residual differs,
+  FFN doesn't. `LlamaModel` gained `gdn_state: Vec<Option<Vec<f32>>>`,
+  the fixed-size recurrent state per `LinearAttn` layer (the KV-cache
+  analogue — allocated at load, zeroed in `reset_kv_cache`, threaded
+  through as `&mut [f32]` at every `forward_layer` call site).
+  `gated_delta_forward` gained a `state: &mut [f32]` parameter so it
+  persists across calls (`forward()` processes one token per call,
+  prefill included — confirmed from `tier3_goldens.rs`'s own usage —
+  so there is no separate "prefill" mode to special-case).
+- **The GPU-fused batch-decode path would have silently bypassed all
+  of this**: `forward_decode_fused_layers` groups adjacent layers by
+  Sdpa geometry (head_dim/kv_heads/window) and hands them to a fused
+  kernel that has never heard of `linear_attn.*`; `LinearAttn` layers'
+  fallback geometry values (meaningless `_ => Sliding` defaults) would
+  have looked like an ordinary uniform group. Added an explicit
+  `is_linear_attn` guard that forces those layers through
+  `forward_layer` (this dispatch) one at a time instead, never through
+  the fused path.
+- **`cargo test -p run` still green** (all 7 runnable suites, including
+  `gated_delta_golden`) after every change in this batch — checked
+  after each of the two prerequisite-bug fixes and after the
+  `forward_layer` wiring itself, not just once at the end.
+- **A second, independent OOM — found, root-caused, and fixed at the
+  RUNTIME's own loader**, not the importer this time:
+  `format.rs::read_model_file`'s own doc comment already said "large
+  files are mmap'd" but then did `mmap[weights_start..weights_end]
+  .to_vec()` anyway — copying the ENTIRE weights section (30 GB for
+  this model) into an owned `Vec<u8>` immediately, on top of every
+  individual tensor's own copy into its `QuantWeight`/`Tensor` a
+  moment later. Same failure class as the import-side fix, same
+  playbook: `ModelFile.weights` is now a `WeightBytes` enum
+  (`Owned(Vec<u8>)` for small files, `Mapped { mmap, weights_start }`
+  for large ones) — `tensor_bytes()` slices directly out of the live
+  mmap for the large-file case, no intermediate full copy. This was
+  pre-existing (unrelated to GatedDeltaNet) and is exactly the
+  documented cause of `gemma-4-31b`'s honeycrisp OOM in `reality.md` —
+  same bug, different model hitting it first.
+- **Still doesn't run end-to-end on THIS machine, right now**: even
+  after the loader fix, `mr run` on the 27B model gets SIGKILLed
+  (exit 137) partway through loading — system free memory collapses
+  to 0 within ~15s of starting and the process dies within ~80-130s.
+  Not a code bug this time as far as traced: the machine has ~12 GB
+  already committed to other running apps (optica, Zed, Telegram,
+  browsers — this user's own session, not mine to close), and this
+  specific model has a large-vocab-specific inefficiency on top of its
+  own honest footprint: `Weights::load` unconditionally dequantizes
+  the FULL `embed_tokens` table to f32 (5.08 GB for 248,320 × 5120)
+  just to serve single-row lookups, and ALSO keeps a quantized mirror
+  (`embed_tokens_quant`, ~1.27 GB) that this specific model never uses
+  since `tie_word_embeddings = false` here — real weight ≈29.5 GB +
+  ~6.3 GB of avoidable embed overhead + ~12 GB other apps gets close
+  enough to 51.5 GB physical that it doesn't fit today. Not touched
+  this session — real, separate, well-scoped fix (row-wise dequant
+  lookup instead of whole-table), but its own piece of work with its
+  own ripple effects (a debug env var reads the full f32 table too).
+
 ## Effort
 
 Real, multi-session work — not a config tweak. Steps 1+3 are small
