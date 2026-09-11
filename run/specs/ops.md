@@ -451,7 +451,7 @@ Dims (config keys, `[architecture]` in `.model`'s config.toml):
 `conv_dim = key_dim*2 + value_dim`. Qwen3.8-27B: 48/16/128/128/4.
 `A_log`/`dt_bias` are `num_v_heads`-length — NOT a multiple of any
 32/256 quant block, so they fall back to `u32` (unquantized) at
-import; see `import/quant.rs`'s block-alignment fallback (`gaps.md`
+import; see `import/quant.rs`'s block-alignment fallback (`../../audit/run/gaps.md`
 #7). Small enough (192 bytes at 48 heads) that this costs nothing.
 
 **Forward** (one layer, hidden_states `[B, T, H]`):

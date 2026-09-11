@@ -25,13 +25,13 @@ neither LlamaStyle nor an existing VL family. Reverse-engineered from
 - `model.visual.*` — plain ViT (patch_embed Conv2d, transformer blocks,
   a merger MLP into the LM's embedding space). This is `ViTStyle`
   fusion, already scoped (scope.md: "Multimodal (VL) ... Curated:
-  hybrid (ViT + LLM)") but reality.md shows the simpler qwen2_vl
+  hybrid (ViT + LLM)") but [runtime report](../../audit/run/reality.md) shows the simpler qwen2_vl
   already erroring ("nested config + VL arch") — this is a
   prerequisite fix, not new scope.
 - `mtp.*` — a DeepSeek-V3-style multi-token-prediction head. Optional:
   correct greedy/sampled generation needs only `language_model.*` +
   `lm_head`. Skip for v1; speculative decoding via MTP is future work
-  (gaps.md #31, already logged as unacknowledged).
+  ([gap audit](../../audit/run/gaps.md) #31, already logged as unacknowledged).
 
 ## Work items, in dependency order
 
@@ -53,7 +53,7 @@ neither LlamaStyle nor an existing VL family. Reverse-engineered from
    `chunk_gated_delta_rule` for the exact recurrence math + a
    sequential (non-chunked) reference form for the CPU/correctness
    path first — matches this project's own "correct first, fast
-   later" ordering (see reality.md's CPU-first verification pattern).
+   later" ordering (see [runtime report](../../audit/run/reality.md)'s CPU-first verification pattern).
 3. **Spec: mixed-family layer stack** — architecture.md's dispatcher
    assumes one family per model; extend to a per-layer family list
    (already implicit in Gemma's variant-flag precedent, needs to be
@@ -68,7 +68,7 @@ neither LlamaStyle nor an existing VL family. Reverse-engineered from
    (Metal/ANE) is a speed follow-up, not a correctness blocker.
 6. **Golden test**: HF `transformers` reference forward pass on a
    short prompt, per-op activation comparison — same bar as
-   qwen3-0.6b-abl's existing golden pass (reality.md).
+   qwen3-0.6b-abl's existing golden pass ([runtime report](../../audit/run/reality.md)).
 
 ## Sequencing note
 
@@ -88,7 +88,7 @@ never fetched the small metadata siblings (config.json, tokenizer.json,
 ...) before dying on a large shard - refetched directly, trivial. And
 `linear_attn.A_log`/`dt_bias` (48 elements/layer, one scalar per head)
 aren't a multiple of the quantizer's 32-wide block - falls back to u32
-per-tensor without crashing (`gaps.md` #7, K-quant block boundaries -
+per-tensor without crashing (`../../audit/run/gaps.md` #7, K-quant block boundaries -
 already a known gap, now with a concrete trigger case).
 
 The real blocker: `import_as` peaked at **54 GB resident (48 GB
