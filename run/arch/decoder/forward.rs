@@ -404,6 +404,7 @@ impl LlamaModel {
                     let s = (h.iter().map(|v| v * v).sum::<f32>() / h.len() as f32).sqrt();
                     let kind = match c.layer_types.get(i).copied() {
                         Some(crate::arch::decoder::config::LayerKind::Full) => "full",
+                        Some(crate::arch::decoder::config::LayerKind::LinearAttn) => "gdn ",
                         _ => "slid",
                     };
                     eprintln!("layer {i:>3} {kind} abs_max={m:>9.4} rms={s:>8.4}");
@@ -526,6 +527,21 @@ fn forward_layer(
     let eps = config.rms_norm_eps;
     if debug_l0 {
         dbg_stats_l(layer_idx, "hidden_in (embed)", &backend.download_f32(hidden)?);
+    }
+    // GatedDeltaNet layers (Qwen3.5/3.8/3-Next "linear_attention") replace
+    // Sdpa entirely and carry different tensors (linear_attn.* rather than
+    // self_attn.*) — every line below this, through the attention block,
+    // is Sliding/Full-shaped and would silently run against the wrong
+    // weights (or tensors that don't exist) if reached. The verified CPU
+    // reference lives in `backend::cpu::gated_delta` (specs/ops.md
+    // §"GatedDeltaNet") but isn't wired into this dispatch yet — refuse
+    // loudly rather than guess.
+    if config.layer_types.get(layer_idx).copied() == Some(crate::arch::decoder::config::LayerKind::LinearAttn) {
+        return Err(BackendError::UnsupportedOp {
+            backend: "forward_layer",
+            op: "GatedDeltaNet (layer_types[i] == linear_attention, not yet wired into forward_layer — see backend::cpu::gated_delta)",
+            input_dtype: hidden.dtype,
+        });
     }
     let hidden_size = config.hidden_size;
     // LlamaStyle+ (Gemma-4) per-layer dims. LlamaStyle returns the global ones.

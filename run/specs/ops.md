@@ -414,6 +414,130 @@ element-wise by the gain vector of shape [head_dim].
 
 Tolerance: same as RmsNorm.
 
+### GatedDeltaNet (Qwen3.5/3.8/3-Next "linear_attention" layers)
+
+A layer that replaces Sdpa entirely (no scores matrix, no Sq×Sk
+softmax) with a per-token recurrent state update — the "delta rule"
+(DeltaNet, gated per Qwen3-Next). `layer_types` marks which of a
+model's layers use this instead of Sdpa; the two coexist within one
+model (e.g. Qwen3.8-27B: 48 GatedDeltaNet layers, 16 Sdpa, 3:1
+interleave, never mixed within a layer).
+
+Verified against `transformers.models.qwen3_5.modeling_qwen3_5`
+(`Qwen3_5GatedDeltaNet`, `torch_recurrent_gated_delta_rule`) —
+2026-09, transformers 5.17.0. The sequential (non-chunked) form below
+matches `torch_recurrent_gated_delta_rule`'s reference math exactly;
+`torch_chunk_gated_delta_rule` is the same computation reassociated
+for parallelism and MUST produce identical output — the sequential
+form is the correctness baseline (same "CPU reference first" order
+as every other family here), a chunked/parallel kernel is a backend
+optimization, not a different answer.
+
+**Per-layer weights** (HF tensor names, `linear_attn.*` under each
+decoder layer):
+```
+in_proj_qkv  [key_dim*2 + value_dim, hidden]   in_proj_z  [value_dim, hidden]
+in_proj_b    [num_v_heads, hidden]             in_proj_a  [num_v_heads, hidden]
+conv1d.weight [conv_dim, 1, kernel_size]  (depthwise, groups=conv_dim, no bias)
+A_log        [num_v_heads]                     dt_bias    [num_v_heads]
+norm.weight  [head_v_dim]        (RmsNormGated gain)
+out_proj     [hidden, value_dim]
+```
+Dims (config keys, `[architecture]` in `.model`'s config.toml):
+`linear_num_value_heads` (num_v_heads), `linear_num_key_heads`
+(num_k_heads), `linear_key_head_dim`, `linear_value_head_dim`,
+`linear_conv_kernel_dim`. `key_dim = num_k_heads * key_head_dim`,
+`value_dim = num_v_heads * value_head_dim`,
+`conv_dim = key_dim*2 + value_dim`. Qwen3.8-27B: 48/16/128/128/4.
+`A_log`/`dt_bias` are `num_v_heads`-length — NOT a multiple of any
+32/256 quant block, so they fall back to `u32` (unquantized) at
+import; see `import/quant.rs`'s block-alignment fallback (`gaps.md`
+#7). Small enough (192 bytes at 48 heads) that this costs nothing.
+
+**Forward** (one layer, hidden_states `[B, T, H]`):
+```
+GatedDeltaNet(x, weights, T):
+  # 1. Projections (all bias-free linear)
+  mixed_qkv = x @ in_proj_qkv^T          # [B, T, conv_dim]
+  z         = x @ in_proj_z^T  -> [B, T, num_v_heads, head_v_dim]
+  b         = x @ in_proj_b^T            # [B, T, num_v_heads]
+  a         = x @ in_proj_a^T            # [B, T, num_v_heads]
+
+  # 2. Causal depthwise conv along T, THEN activation (silu).
+  #    groups=conv_dim: channel c only sees its own kernel row.
+  #    "Causal": pad kernel_size-1 zeros on the LEFT, no lookahead.
+  mixed_qkv = Silu(CausalConv1d(mixed_qkv, conv1d.weight, kernel_size))
+
+  query, key, value = split(mixed_qkv, [key_dim, key_dim, value_dim], dim=-1)
+  query -> [B, T, num_k_heads, head_k_dim]
+  key   -> [B, T, num_k_heads, head_k_dim]
+  value -> [B, T, num_v_heads, head_v_dim]
+
+  # 3. Gates
+  beta = Sigmoid(b)                                  # [B, T, num_v_heads]
+  g    = -Exp(A_log) * Softplus(a + dt_bias)          # [B, T, num_v_heads], log-space decay (<=0)
+
+  # 4. K/Q head expansion to num_v_heads (GQA-style, repeat_interleave —
+  #    see "GQA expansion" above; same rule, num_v_heads/num_k_heads ratio)
+  if num_v_heads > num_k_heads:
+    query, key = repeat_interleave(query, key, ratio=num_v_heads/num_k_heads, dim=2)
+
+  # 5. L2-normalize query and key per head (eps=1e-6), THEN scale query
+  query = L2Norm(query, dim=-1) / sqrt(head_k_dim)
+  key   = L2Norm(key, dim=-1)
+
+  # 6. Sequential recurrence — the actual "delta rule". One state
+  #    matrix per (batch, head): [head_k_dim, head_v_dim]. head_k_dim
+  #    and head_v_dim need not match (128/128 here, but not assumed).
+  state = zeros([B, num_v_heads, head_k_dim, head_v_dim])
+  for t in 0..T:
+    q_t, k_t, v_t = query[:,:,t], key[:,:,t], value[:,:,t]
+    decay_t = Exp(g[:,:,t])                    # [B, num_v_heads], scalar per head
+    state = state * decay_t[...,None,None]     # decay the WHOLE state matrix
+    kv_mem = sum_k( state[...,k,:] * k_t[...,k] )   # = k_t @ state, [B,H,head_v_dim]
+    delta  = (v_t - kv_mem) * beta[:,:,t][...,None]
+    state  = state + outer(k_t, delta)         # rank-1 update: state[h,i,j] += k_t[h,i]*delta[h,j]
+    out[:,:,t] = sum_k( state[...,k,:] * q_t[...,k] )  # = q_t @ state, [B,H,head_v_dim]
+
+  # 7. Gated RMSNorm (norm BEFORE gate multiply, not after), then out_proj
+  out = RmsNorm(out, eps=1e-6) * norm.weight * Silu(z)   # per head_v_dim, reduction over head_v_dim only
+  return out.reshape(B, T, value_dim) @ out_proj^T       # [B, T, hidden]
+```
+
+**Numerically load-bearing details** (each one differs from the
+"obvious" reading and silently breaks output if missed):
+- Recurrence runs in **f32** regardless of the model's storage dtype
+  (the reference casts explicitly before the loop) — bf16 accumulation
+  over hundreds of steps compounds error the decay/delta terms are
+  sized against.
+- `g` (decay) is **log-space and non-positive**: `state *= exp(g_t)`,
+  not `state *= g_t`. `A_log` is stored as `log(A)`, `A` itself never
+  materializes.
+- L2Norm on Q/K happens **after** conv+split, **before** the
+  recurrence loop — not fused into the projections.
+- Query scaling (`/ sqrt(head_k_dim)`) happens **after** L2Norm, not
+  before — order matters, L2Norm removes magnitude so a pre-scale
+  would be silently discarded.
+- RmsNormGated normalizes, multiplies by the learned gain, **then**
+  multiplies by `Silu(z)` — z is a gate on the normalized-and-scaled
+  output, not a pre-norm input.
+- No causal mask needed anywhere — the sequential loop **is** the
+  causality (token t only ever reads state built from tokens < t).
+
+**KV-cache analogue:** GatedDeltaNet layers carry no growing KV
+cache — `state` is one fixed-size `[head_k_dim, head_v_dim]` matrix
+per head, updated in place every token. A decode step is one loop
+iteration, not an append to a growing tensor (see `KvCache` above,
+which this layer type does not use at all). This is the practical
+payoff of the 3:1 interleave: 48 of 64 layers carry O(1) memory
+across arbitrarily long context, only 16 carry the usual O(T) KvCache.
+
+Tolerance: same as Sdpa (this is attention's replacement, not a new
+numeric regime) — but verify in f32 given the recurrence's own
+internal f32 requirement above; testing the bf16-storage round-trip
+at the tensor boundary is a separate, additional check, not a
+substitute for it.
+
 ## 6. Convolution
 
 ### Conv1d, Conv2d, Conv3d

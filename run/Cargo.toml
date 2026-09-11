@@ -66,6 +66,10 @@ name = "tier3_goldens"
 path = "tests/tier3_goldens.rs"
 
 [[test]]
+name = "gated_delta_golden"
+path = "tests/gated_delta_golden.rs"
+
+[[test]]
 name = "tier4_ir_exec"
 path = "tests/tier4_ir_exec.rs"
 

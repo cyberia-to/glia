@@ -5,6 +5,52 @@
 //! not a binary it hopes is on PATH. `mi` calls this too — one pipeline,
 //! two doors.
 
+use std::io::Write as _;
+
+/// Where the packing loop reads a tensor's bytes from. Safetensors sources
+/// go through [`crate::loader::safetensors::LazySafetensors`] so a 27B
+/// model's ~55 GB never sits fully in the heap at once (see
+/// `run/specs/gated-delta-vl-plan.md`, "import itself OOMs") — one
+/// tensor's bytes are copied out of its shard's mmap, packed, written,
+/// and dropped before the next tensor is touched. GGUF/ONNX sources keep
+/// the older eager path; `take` still frees each entry as it's consumed,
+/// which costs nothing extra and helps large GGUF sources for free.
+enum Source {
+    Eager(crate::types::Weights),
+    Lazy(crate::loader::safetensors::LazySafetensors),
+}
+
+impl Source {
+    fn names(&self) -> Vec<String> {
+        match self {
+            Source::Eager(w) => w.weights.keys().cloned().collect(),
+            Source::Lazy(l) => l.names(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Source::Eager(w) => w.len(),
+            Source::Lazy(l) => l.names().len(),
+        }
+    }
+
+    fn dtype_of(&self, name: &str) -> Option<crate::types::DType> {
+        match self {
+            Source::Eager(w) => w.weights.get(name).map(|t| t.dtype),
+            Source::Lazy(l) => l.dtype_shape(name).map(|(d, _)| d),
+        }
+    }
+
+    /// Take this tensor's bytes, freeing them from wherever they were held.
+    fn take(&mut self, name: &str) -> Option<crate::types::Weight> {
+        match self {
+            Source::Eager(w) => w.weights.remove(name),
+            Source::Lazy(l) => l.read(name),
+        }
+    }
+}
+
 /// Convert a snapshot directory (weights + tokenizer.json + config.json) to
 /// a canonical `.model` in the models directory, named `<output_name>.model`.
 /// Returns the written path.
@@ -75,10 +121,20 @@ pub fn import_snapshot(
     };
 
     let t_load = std::time::Instant::now();
-    let weights = crate::loader::load_model(&gguf_path)
-        .map_err(|e| format!("weights load failed: {e}"))?;
+    let is_safetensors_source = ext_eq(&gguf_path, "safetensors");
+    let mut weights = if is_safetensors_source {
+        Source::Lazy(
+            crate::loader::safetensors::open_lazy(&gguf_path)
+                .map_err(|e| format!("weights index failed: {e}"))?,
+        )
+    } else {
+        Source::Eager(
+            crate::loader::load_model(&gguf_path).map_err(|e| format!("weights load failed: {e}"))?,
+        )
+    };
     println!(
-        "Loaded {} tensors in {:.1}s",
+        "{} {} tensors in {:.1}s",
+        if is_safetensors_source { "Indexed" } else { "Loaded" },
         weights.len(),
         t_load.elapsed().as_secs_f64()
     );
@@ -353,12 +409,15 @@ print('\n'.join(lines))
         String::new()
     };
 
-    // Log dtype distribution for transparency.
+    // Log dtype distribution for transparency. Names + dtype only — no
+    // tensor bytes touched, so this costs nothing extra on the lazy path.
     {
         let mut dtype_counts: std::collections::HashMap<String, usize> =
             std::collections::HashMap::new();
-        for w in weights.weights.values() {
-            *dtype_counts.entry(format!("{:?}", w.dtype)).or_default() += 1;
+        for name in weights.names() {
+            if let Some(dtype) = weights.dtype_of(&name) {
+                *dtype_counts.entry(format!("{dtype:?}")).or_default() += 1;
+            }
         }
         let mut counts: Vec<_> = dtype_counts.into_iter().collect();
         counts.sort();
@@ -367,10 +426,17 @@ print('\n'.join(lines))
 
     println!("Packing {} tensors...", weights.len());
     let mut tensors_lines: Vec<String> = Vec::new();
-    let mut weight_data: Vec<u8> = Vec::new();
+    // Packed bytes stream straight to a temp file instead of an in-memory
+    // Vec — a 27B model's packed output alone is 15-20 GB, and holding
+    // both that and the source tensors in the heap is what wedged the
+    // importer at 54 GB resident on a 48 GB machine (gated-delta-vl-plan.md).
+    let weight_tmp_path = std::env::temp_dir().join(format!("{output_name}.weights.tmp"));
+    let weight_tmp_file = std::fs::File::create(&weight_tmp_path)
+        .map_err(|e| format!("cannot create {}: {e}", weight_tmp_path.display()))?;
+    let mut weight_out = std::io::BufWriter::new(weight_tmp_file);
     let mut offset = 0usize;
 
-    let mut tensor_names: Vec<&String> = weights.weights.keys().collect();
+    let mut tensor_names: Vec<String> = weights.names();
     tensor_names.sort();
 
     // Existing HF-canonical names in the source. Used to detect K=V layers
@@ -398,7 +464,11 @@ print('\n'.join(lines))
     let mut counts_by_enc: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
 
     for tname in &tensor_names {
-        let w = &weights.weights[*tname];
+        let Some(w) = weights.take(tname) else {
+            eprintln!("warn: {tname} vanished between indexing and packing, skipping");
+            continue;
+        };
+        let w = &w;
         let hf_name = crate::naming::gguf_to_hf(tname);
 
         // K-quant pass-through / re-encoding strategy:
@@ -477,7 +547,9 @@ print('\n'.join(lines))
             "[\"{}\"]\nshape    = [{}]\nencoding = \"{}\"\noffset   = {}\nsize     = {}\n",
             hf_name, shape_str, written_enc, offset, size
         ));
-        weight_data.extend_from_slice(&canonical_bytes);
+        weight_out
+            .write_all(&canonical_bytes)
+            .map_err(|e| format!("writing {hf_name}: {e}"))?;
         offset += size;
         let data_ref: &[u8] = &canonical_bytes;
 
@@ -498,7 +570,9 @@ print('\n'.join(lines))
                                 "[\"{}\"]\nshape    = [{}]\nencoding = \"{}\"\noffset   = {}\nsize     = {}\n",
                                 v_name, shape_str, written_enc, offset, size
                             ));
-                            weight_data.extend_from_slice(data_ref);
+                            weight_out
+                                .write_all(data_ref)
+                                .map_err(|e| format!("writing {v_name}: {e}"))?;
                             offset += size;
                         }
                     }
@@ -516,9 +590,13 @@ print('\n'.join(lines))
     }
     println!(
         "  weights: {} bytes ({:.1} GB)",
-        weight_data.len(),
-        weight_data.len() as f64 / 1e9
+        offset,
+        offset as f64 / 1e9
     );
+    weight_out
+        .flush()
+        .map_err(|e| format!("flushing {}: {e}", weight_tmp_path.display()))?;
+    drop(weight_out);
 
     // The optional ~~~graph section is not part of the canonical .model
     // spec (cyb/cyb-model). Re-introduce as a formal extension if useful.
@@ -529,7 +607,7 @@ print('\n'.join(lines))
     let output_path = models_dir.join(format!("{output_name}.model"));
     println!("Writing {}...", output_path.display());
 
-    crate::cyb_format::write_model_file(
+    crate::cyb_format::write_model_file_streaming(
         &output_path,
         output_name,
         &card,
@@ -540,8 +618,10 @@ print('\n'.join(lines))
         &tensors_toml,
         &vocab_toml,
         "",
-        &weight_data,
+        &weight_tmp_path,
+        offset as u64,
     )
     .map_err(|e| format!("write failed: {e}"))?;
+    let _ = std::fs::remove_file(&weight_tmp_path);
     Ok(output_path)
 }

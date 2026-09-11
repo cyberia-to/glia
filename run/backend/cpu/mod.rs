@@ -17,6 +17,7 @@ mod rmsnorm;
 mod rope;
 mod softmax;
 mod activation;
+pub mod gated_delta;
 pub mod quant;
 pub mod quant_matmul;
 

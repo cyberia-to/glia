@@ -6,10 +6,21 @@ use crate::format::FormatError;
 /// Per-layer attention kind. LlamaStyle has all `Sliding` (single shape).
 /// LlamaStyle+ (Gemma 3/4) interleaves `Sliding` and `Full`; full layers
 /// in Gemma 4 use `global_head_dim` / `num_global_key_value_heads`.
+/// Qwen3.5/3.8/3-Next interleave `Sliding`/`Full` (relabeled "full" vs
+/// everything else by the source `layer_types`) with `LinearAttn` — a
+/// GatedDeltaNet layer that replaces Sdpa entirely (spec: ops.md
+/// §"GatedDeltaNet"). `LinearAttn` deliberately has NO defaults here:
+/// every `layer_head_dim`/`layer_kv_heads`/`layer_window`/`layer_rope_*`
+/// method below is Sliding/Full-shaped math that does not apply to it,
+/// and `forward_layer` must branch to `backend::cpu::gated_delta` before
+/// calling any of them for a `LinearAttn` layer — see that dispatch's own
+/// comment for why silently falling through here used to be a bug, not
+/// a feature.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LayerKind {
     Sliding,
     Full,
+    LinearAttn,
 }
 
 /// Activation function for the FFN gate.
@@ -295,6 +306,12 @@ impl LlamaConfig {
                     .filter_map(|v| v.as_str())
                     .map(|s| match s {
                         "full_attention" | "full" => LayerKind::Full,
+                        // Was silently landing in the `_ => Sliding` arm
+                        // below (Qwen3.8-27B: 48 of 64 layers) — Sliding
+                        // means "run Sdpa against self_attn tensors that
+                        // do not exist on this layer" (it has linear_attn.*
+                        // instead). See LayerKind's doc comment.
+                        "linear_attention" => LayerKind::LinearAttn,
                         _ => LayerKind::Sliding,
                     })
                     .collect()
