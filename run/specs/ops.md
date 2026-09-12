@@ -224,11 +224,26 @@ MropeCosSin(positions[seq_len][3], rope_dim, rope_theta):
       cos[t][j] = cos[t][j+n_freq] = cos(angle)
       sin[t][j] = sin[t][j+n_freq] = sin(angle)
 ```
-Applied to Q/K via the SAME `rotate_half` + `q*cos + rotate_half(q)*sin`
-as plain RoPE — only cos/sin construction differs. `rope_dim < head_dim`
-(partial rotary, 64 of 256): the trailing `head_dim - rope_dim` dims
-pass through unrotated, same convention as `layer_rope_dim`'s existing
-Gemma-4 partial-rotary case (ops.md's plain Rope section above).
+**Applied to Q/K with a DIFFERENT partial-rotary index layout than
+Gemma-4's `rope_f32`** — verified from source, do not assume these
+generalize to each other:
+- Gemma-4 (`_compute_proportional_rope_parameters`, `rope_f32`):
+  pairs dim `j` with dim `j + head_dim/2` across the FULL head_dim;
+  the un-rotated portion is zero-frequency pairs INTERLEAVED with the
+  rotated ones (identity rotation, `cos=1,sin=0`), not a contiguous
+  block. `rope_f32` implements exactly this and is correct for it.
+- Qwen3.5/3.8 (`rope_type="default"`, `Qwen3_5Attention`'s own
+  `apply_rotary_pos_emb`): `rope_dim` is a plain CONTIGUOUS PREFIX —
+  `x_rot = x[..rope_dim]` gets `rotate_half` applied treating that
+  prefix as its own self-contained vector (split at `rope_dim/2`, not
+  `head_dim/2`), `x_pass = x[rope_dim..head_dim]` is copied through
+  UNCHANGED as a contiguous tail appended after. `apply_rope_cos_sin_f32`
+  (`run/backend/cpu/mrope.rs`) implements this; it is NOT
+  interchangeable with `rope_f32` except in the trivial case
+  `rope_dim == head_dim` (no partial rotary at all, where both
+  conventions collapse to the same full-width rotation). Golden-tested
+  against real `apply_rotary_pos_emb` output to float32 machine
+  precision (5.96e-8) in `run/tests/mrope_golden.rs`.
 
 **Text-stream fusion** (image-embedding splice, `masked_scatter`):
 `image_embeds = visual(pixel_values, grid_thw).pooler_output` (the

@@ -13,7 +13,7 @@
 //!
 //! Spec: specs/ops.md §3 "Rope"; gated-delta-vl-plan.md's fusion trace.
 
-use run::backend::cpu::mrope::{mrope_cos_sin, mrope_position_ids, ModalityRun};
+use run::backend::cpu::mrope::{apply_rope_cos_sin_f32, mrope_cos_sin, mrope_position_ids, ModalityRun};
 use std::path::{Path, PathBuf};
 
 const DIR: &str = "/tmp/mrope_golden";
@@ -118,4 +118,15 @@ fn mrope_matches_hf_reference() {
     eprintln!("worst cos diff {worst_cos} (max|hf|={max_cos}), worst sin diff {worst_sin} (max|hf|={max_sin})");
     assert!(worst_cos < 1e-5, "cos diverges from HF reference: {worst_cos}");
     assert!(worst_sin < 1e-5, "sin diverges from HF reference: {worst_sin}");
+
+    // apply_rope_cos_sin_f32 vs. the real Qwen3_5Attention partial-rotary
+    // apply_rotary_pos_emb (contiguous rope_dim prefix rotated, tail
+    // passed through) on a synthetic Q vector.
+    let (q_shape, q_input) = read_dump(&PathBuf::from(DIR).join("q_input.bin"));
+    assert_eq!(q_shape, vec![seq_len, head_dim]);
+    let ours_q = apply_rope_cos_sin_f32(&q_input, &ours_cos, &ours_sin, head_dim, rope_dim);
+    let (_, hf_q) = read_dump(&PathBuf::from(DIR).join("q_rotated.bin"));
+    let (worst_q, max_q) = worst_diff(&ours_q, &hf_q);
+    eprintln!("worst q_rotated diff {worst_q} (max|hf|={max_q})");
+    assert!(worst_q < 1e-5, "apply_rope_cos_sin_f32 diverges from HF reference: {worst_q}");
 }

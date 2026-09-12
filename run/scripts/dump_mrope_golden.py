@@ -75,6 +75,17 @@ dummy_x = torch.zeros(1, dtype=torch.float32)
 cos, sin = rotary(dummy_x, position_ids)
 print("cos shape", cos.shape)
 
+# Real apply_rotary_pos_emb (Qwen3_5Attention's partial-rotary application:
+# contiguous rope_dim prefix rotated, remaining head_dim-rope_dim dims
+# passed through as a tail) on a synthetic Q vector, one head.
+from transformers.models.qwen3_5.modeling_qwen3_5 import apply_rotary_pos_emb
+
+torch.manual_seed(99)
+head_dim = real_tc["head_dim"]
+seq_len = input_ids.shape[1]
+q = torch.randn(1, 1, seq_len, head_dim, dtype=torch.float32) * 0.3  # (batch, heads=1, seq, head_dim)
+q_rotated, _ = apply_rotary_pos_emb(q, q, cos, sin)
+
 
 def dump(path, t):
     arr = t.detach().contiguous().to(torch.float32).numpy()
@@ -92,6 +103,8 @@ dump(f"{OUT}/grid_thw.bin", grid_thw.float())
 dump(f"{OUT}/position_ids.bin", position_ids.float())
 dump(f"{OUT}/cos.bin", cos)
 dump(f"{OUT}/sin.bin", sin)
+dump(f"{OUT}/q_input.bin", q[0, 0])
+dump(f"{OUT}/q_rotated.bin", q_rotated[0, 0])
 
 with open(f"{OUT}/meta.json", "w") as f:
     json.dump(

@@ -116,3 +116,40 @@ pub fn mrope_cos_sin(
     }
     (cos, sin)
 }
+
+/// Rotates `x` (`[..., head_dim]`) using precomputed per-token
+/// `cos`/`sin` (`[seq_len, rope_dim]`, from `mrope_cos_sin`).
+///
+/// **Different index convention from `rope.rs::rope_f32`** — that
+/// function (built for Gemma-4's "proportional" rope_type) pairs
+/// dim `j` with dim `j + head_dim/2` across the FULL head_dim, with
+/// the unrotated portion interleaved as zero-frequency (identity)
+/// pairs. Qwen3.5/3.8 (`rope_type="default"`, HF's
+/// `Qwen3_5Attention`/generic `apply_rotary_pos_emb`) instead treats
+/// the rotated dims as a plain CONTIGUOUS PREFIX: `x_rot = x[..
+/// rope_dim]` gets `rotate_half` applied treating that prefix as its
+/// own self-contained vector (splitting it at `rope_dim/2`, not
+/// `head_dim/2`), and `x_pass = x[rope_dim..head_dim]` is copied
+/// through UNCHANGED as a contiguous tail. Verified against real
+/// `apply_rotary_pos_emb` output in `run/tests/mrope_golden.rs` — do
+/// not "simplify" this to reuse `rope_f32`, the two are only
+/// equivalent when `rope_dim == head_dim`.
+pub fn apply_rope_cos_sin_f32(x: &[f32], cos: &[f32], sin: &[f32], head_dim: usize, rope_dim: usize) -> Vec<f32> {
+    let half = rope_dim / 2;
+    let n = x.len() / head_dim;
+    let mut out = vec![0f32; x.len()];
+    for row in 0..n {
+        let x_row = &x[row * head_dim..(row + 1) * head_dim];
+        let c = &cos[row * rope_dim..(row + 1) * rope_dim];
+        let s = &sin[row * rope_dim..(row + 1) * rope_dim];
+        let out_row = &mut out[row * head_dim..(row + 1) * head_dim];
+        for j in 0..half {
+            let x1 = x_row[j];
+            let x2 = x_row[j + half];
+            out_row[j] = x1 * c[j] - x2 * s[j];
+            out_row[j + half] = x2 * c[j + half] + x1 * s[j + half];
+        }
+        out_row[rope_dim..head_dim].copy_from_slice(&x_row[rope_dim..head_dim]);
+    }
+    out
+}
