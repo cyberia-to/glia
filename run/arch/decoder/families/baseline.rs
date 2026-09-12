@@ -18,5 +18,6 @@ pub fn profile() -> FamilyProfile {
         scaled_embeddings: false,
         v_norm_per_head: false,
         attn_scale: AttnScale::PerHeadDim,
+        has_attn_output_gate: false,
     }
 }

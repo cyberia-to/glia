@@ -397,7 +397,12 @@ fn load_layer(
         });
     }
 
-    let q_proj  = quant_nk("self_attn.q_proj.weight", q_dim, hidden)?;
+    // Qwen3.5/3.8: q_proj is TWICE q_dim wide (Q + a per-element sigmoid
+    // gate applied to the attention output later — see FamilyProfile::
+    // has_attn_output_gate's doc comment). o_proj below still takes the
+    // ungated q_dim width: the gate never reaches it.
+    let q_proj_dim = if config.family.has_attn_output_gate { q_dim * 2 } else { q_dim };
+    let q_proj  = quant_nk("self_attn.q_proj.weight", q_proj_dim, hidden)?;
     let k_proj  = quant_nk("self_attn.k_proj.weight", kv_dim, hidden)?;
     let v_proj  = quant_nk("self_attn.v_proj.weight", kv_dim, hidden)?;
     if i == 0 && std::env::var("RUN_DEBUG_WEIGHTS").is_ok() {

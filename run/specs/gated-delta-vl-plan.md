@@ -732,3 +732,89 @@ on CPU yet (scoped and golden-tested standalone only). A full-pipeline
 GPU fusion for GatedDeltaNet, and any GPU work for VisionTower, remain
 open — each is its own multi-hour-plus undertaking, not a quick
 follow-on to what's here.
+
+## Progress — 2026-09-12, the first true end-to-end test — and what it found
+
+Built `run/tests/e2e_multimodal.rs`: a REAL (tiny) Qwen3.5-family HF
+model — real `transformers` classes, real random-seeded weights, real
+`save_pretrained` → real `mi import` → real `.model` file → real
+`LlamaModel::load` → real sequential `forward_ex` decode, one token
+at a time exactly like the live CLI decode loop — compared against
+that SAME tiny model's real batched HF forward pass. `run/scripts/
+dump_e2e_tiny_model.py` builds it (4 layers, mixed
+`linear_attention`/`full_attention`, a real 1-block vision tower, a
+real image in the prompt) and dumps the golden logits + per-layer
+hidden states. This exists because every piece so far had been
+golden-tested in ISOLATION (real weights, but hand-fed correctly-
+normalized inputs extracted directly from HF) — nothing had ever
+exercised this codebase's OWN embed → norm → layer chain, which is
+exactly where both bugs below were hiding.
+
+**Two real, previously invisible bugs found, in order:**
+
+1. **`q_proj` gate, wrong width then wrong layout.** First import
+   attempt failed outright (`q_proj` shape mismatch) — the real
+   `Qwen3_5Attention.q_proj` is `num_heads*head_dim*2` wide (Q
+   concatenated with a per-element attention-output gate,
+   `Qwen3_5Attention.forward`'s `torch.chunk(..., 2, dim=-1)` after a
+   `.view(..., num_heads, head_dim*2)`), never noticed before because
+   nothing had loaded a real `self_attn.q_proj` tensor end-to-end
+   until this test. Fixed by adding `FamilyProfile::
+   has_attn_output_gate` (new `families/qwen3_5.rs`), doubling
+   `q_proj`'s loaded width, and splitting+gating in `forward_layer`.
+   First split attempt got the LAYOUT wrong too (assumed
+   `[all_Q, all_gate]` instead of per-head-interleaved
+   `[h0_q,h0_gate,h1_q,h1_gate,...]`) — shape-compatible, numerically
+   wrong, caught by comparing real per-element output, not just
+   shapes. See ops.md's new "Attention output gate" section.
+2. **`Qwen3_5RMSNorm`'s zero-centered `(1+weight)` gain, missing
+   entirely — the dominant bug.** After fixing (1), the test still
+   diverged ~70% worst-case (Pearson correlation ~0.72) from real HF
+   output — growing visibly WORSE with depth (each layer has two
+   `Qwen3_5RMSNorm` applications, so a wrong gain compounds). Root
+   cause: `Qwen3_5RMSNorm.forward` applies `x_normed * (1.0 +
+   weight)`, matching Gemma 1/2/3's zero-centered convention this
+   codebase already has infrastructure for
+   (`FamilyProfile::rmsnorm_plus_one`, baked into the weight at load
+   time via `weights.rs::offset_norm_by_one`) — but the new
+   `families/qwen3_5.rs` profile had set this to `false`, on the
+   unchecked assumption that "Qwen" family always means plain
+   `weight * x`. Flipping one field to `true` was the entire fix — the
+   existing `offset_norm_by_one` call sites already cover exactly the
+   right tensors (`input_layernorm`, `post_attention_layernorm`,
+   `q_norm`, `k_norm`, final `norm`) and already correctly EXCLUDE
+   GatedDeltaNet's own `Qwen3_5RMSNormGated` (a genuinely different
+   class — `weight` inits to `torch.ones`, plain multiply, no `+1` —
+   already implemented correctly, never needed fixing). After this
+   fix: worst-case divergence ~4%, Pearson correlation ~0.999 —
+   consistent with ordinary Q8 quantization noise through a real
+   multi-layer pipeline, not a remaining bug. See ops.md's new
+   "RMSNorm zero-centered gain" section for the full writeup,
+   including why the isolated golden tests structurally could not
+   have caught this (they feed pre-normalized input extracted from
+   HF, never exercising this codebase's own norm application).
+
+**This second bug affects the REAL 27B model too**, in every one of
+its 64 layers (both `linear_attention` and `full_attention` layers
+share `input_layernorm`/`post_attention_layernorm`; the 16
+`full_attention` layers additionally have `q_norm`/`k_norm` affected)
+plus the final model norm — it was never caught earlier because the
+real Qwen3.8-27B model has never been loadable on this machine (the
+memory ceiling) to exercise it. Both `qwen3-8b-heretic.model` (plain Qwen3, `rmsnorm_plus_one`
+correctly `false` for that family, unaffected) and
+`qwen3.8-27b-heretic.model` re-imported after this fix — the 27B
+model still can't be loaded to confirm end-to-end (memory ceiling,
+deferred), but the config extraction + weight loading for it now goes
+through the corrected `families/qwen3_5.rs` profile.
+
+**Test calibration note**: `e2e_multimodal.rs` uses a 10% relative
+logit tolerance plus a Pearson-correlation floor (0.98), deliberately
+looser than the ~1e-4 relative used by the pure-f32 isolated golden
+tests. Measured empirically: a real wiring bug here produced 60-80%
+worst-case divergence and correlation <0.75; correctly-wired real Q8
+quantization noise measures ~4% divergence and correlation >0.999.
+The gap between those two regimes is wide enough that 10%/0.98 won't
+mask a real regression while still tolerating legitimate quantization
+noise — tightening this further would require either f32-precision
+weights for the whole pipeline (not just the tiny aux tensors) or
+accepting more sporadic false failures from Q8 noise alone.

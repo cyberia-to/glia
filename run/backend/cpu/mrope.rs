@@ -134,14 +134,25 @@ pub fn mrope_cos_sin(
 /// `apply_rotary_pos_emb` output in `run/tests/mrope_golden.rs` — do
 /// not "simplify" this to reuse `rope_f32`, the two are only
 /// equivalent when `rope_dim == head_dim`.
+///
+/// `x` may hold MULTIPLE HEADS for the SAME token position (the shape
+/// `forward_layer` actually passes: `[num_heads, head_dim]`, one
+/// position) — `cos`/`sin` (length `pos_len * rope_dim`) broadcast
+/// across `x.len() / head_dim / pos_len` heads per position, same
+/// convention as `rope.rs::rope_f32`'s `heads_per_pos`. The common
+/// decode case is `pos_len == 1` (one token, N heads all sharing the
+/// same rotation).
 pub fn apply_rope_cos_sin_f32(x: &[f32], cos: &[f32], sin: &[f32], head_dim: usize, rope_dim: usize) -> Vec<f32> {
     let half = rope_dim / 2;
     let n = x.len() / head_dim;
+    let pos_len = (cos.len() / rope_dim).max(1);
+    let heads_per_pos = (n / pos_len).max(1);
     let mut out = vec![0f32; x.len()];
     for row in 0..n {
         let x_row = &x[row * head_dim..(row + 1) * head_dim];
-        let c = &cos[row * rope_dim..(row + 1) * rope_dim];
-        let s = &sin[row * rope_dim..(row + 1) * rope_dim];
+        let p_idx = row / heads_per_pos;
+        let c = &cos[p_idx * rope_dim..(p_idx + 1) * rope_dim];
+        let s = &sin[p_idx * rope_dim..(p_idx + 1) * rope_dim];
         let out_row = &mut out[row * head_dim..(row + 1) * head_dim];
         for j in 0..half {
             let x1 = x_row[j];

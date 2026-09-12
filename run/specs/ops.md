@@ -524,6 +524,76 @@ element-wise by the gain vector of shape [head_dim].
 
 Tolerance: same as RmsNorm.
 
+### Attention output gate (Qwen3.5/3.8 `full_attention` layers)
+
+Found via `run/tests/e2e_multimodal.rs` (the first end-to-end test of
+this family's wiring) — NOT present in plain Qwen3 (confirmed absent
+from `Qwen3Attention.__init__` in the real source), confirmed present
+in the real 27B model's actual `q_proj` tensor shape (`[12288, 5120]`
+= `24 heads * 256 head_dim * 2`, not the plain `[6144, 5120]`).
+
+`q_proj` produces Q and a per-element sigmoid gate CONCATENATED, PER
+HEAD (not `[all_Q, all_gate]` globally — getting this backwards is
+shape-compatible but numerically wrong, the first bug this test
+caught here):
+```
+q_proj(x): [num_heads * head_dim * 2] laid out as
+  [h0_q(head_dim), h0_gate(head_dim), h1_q(head_dim), h1_gate(head_dim), ...]
+# HF: q_proj(x).view(..., num_heads, head_dim*2).chunk(2, dim=-1)
+```
+`query` (first half of each head) gets q_norm + RoPE exactly as usual.
+`gate` (second half) gets NEITHER — held aside untouched until after
+Sdpa:
+```
+attn_out = Sdpa(q_roped, k_roped, v)      # [num_heads*head_dim], ungated width
+attn_out = attn_out * sigmoid(gate)        # per-element, same layout as attn_out
+out = attn_out @ o_proj^T                  # o_proj's input width is the UNGATED
+                                            # num_heads*head_dim — gate is fully
+                                            # consumed before this point
+```
+GPU/fused attention paths that run `o_proj` internally (this crate's
+`fused_attn_oproj_residual`) have no hook for this gate and are
+excluded for `full_attention` layers in this family — CPU per-layer
+path only, same precedent as GatedDeltaNet.
+
+### RMSNorm zero-centered gain (`Qwen3_5RMSNorm`, Qwen3.5/3.8 — NOT GatedDeltaNet's own norm)
+
+The SECOND bug `e2e_multimodal.rs` caught, and the dominant one — it
+alone accounted for ~70% worst-case logit divergence and Pearson
+correlation ~0.72 against real HF output; fixing it alone brought
+divergence to ~4% (correlation ~0.999, consistent with ordinary Q8
+quantization noise, not a remaining bug).
+
+`Qwen3_5RMSNorm.forward` (real source):
+```python
+output = x * rsqrt(mean(x^2) + eps)
+output = output * (1.0 + weight)   # NOT `output * weight`
+```
+`weight` is initialized to `torch.zeros(dim)` — so untrained/neutral
+is `weight=0 → gain=1.0`, the SAME zero-centered convention this
+codebase already has for Gemma 1/2/3 (`FamilyProfile::rmsnorm_plus_one`,
+baked into the weight itself at load time via `offset_norm_by_one` —
+`run/arch/decoder/weights.rs` — so the runtime's `Op::RmsNorm` always
+does a plain multiply regardless of family). Qwen3.5/3.8 needs
+`rmsnorm_plus_one: true`, applying to `input_layernorm`,
+`post_attention_layernorm`, `q_norm`, `k_norm`, and the model's final
+`norm` — i.e. every norm in the text decoder EXCEPT ONE:
+**GatedDeltaNet's own `Qwen3_5RMSNormGated` is a genuinely different
+class** (`weight` inits to `torch.ones`, plain `weight * x`, no `+1`)
+— already correctly implemented as a plain multiply in
+`backend::cpu::gated_delta`'s hand-written norm step, which doesn't
+go through `Op::RmsNorm`/`rmsnorm_plus_one` at all. Do not "fix" that
+one to match — it was already right.
+
+This is exactly why the pre-`e2e_multimodal.rs` verification story
+was incomplete: `gated_delta_golden.rs` feeds REAL, ALREADY-NORMALIZED
+input extracted directly from a real HF forward pass — it never
+exercises this codebase's OWN `Op::RmsNorm`/`input_layernorm`
+application at all, so a wrong `rmsnorm_plus_one` setting was
+invisible to it by construction. Only a test that runs the actual
+embed → norm → layer chain (i.e. the real decode loop) can catch this
+class of bug — which is the whole reason `e2e_multimodal.rs` exists.
+
 ### GatedDeltaNet (Qwen3.5/3.8/3-Next "linear_attention" layers)
 
 A layer that replaces Sdpa entirely (no scores matrix, no Sq×Sk

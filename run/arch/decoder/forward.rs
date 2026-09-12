@@ -755,6 +755,12 @@ fn forward_layer(
     let num_heads = config.num_attention_heads;
     let kv_heads = config.layer_kv_heads(layer_idx);
     let sliding_window = config.layer_window(layer_idx);
+    // Qwen3.5/3.8: q_proj produces Q ++ a per-element attention-output
+    // gate, concatenated (see FamilyProfile::has_attn_output_gate).
+    // Forces the plain per-op matmul path below — `fused_norm_qkv_qknorm`
+    // assumes q_proj's output width is exactly num_heads*head_dim and
+    // would reshape/qk_norm this layer's DOUBLE-width output incorrectly.
+    let is_gated_attn = config.family.has_attn_output_gate;
 
     // 1+2(+optionally qk_norm). For qwen3 (qk_norm + no bias), fuse the WHOLE
     // chain (input_norm + qkv + qk_norm) into ONE command buffer.
@@ -762,7 +768,7 @@ fn forward_layer(
     let no_bias = layer.q_proj_bias.is_none()
         && layer.k_proj_bias.is_none()
         && layer.v_proj_bias.is_none();
-    let (mut q, mut k, mut v, qk_norm_done) = if no_bias {
+    let (mut q, mut k, mut v, qk_norm_done) = if no_bias && !is_gated_attn {
         if let (Some(qn), Some(kn)) = (&layer.q_norm, &layer.k_norm) {
             let (qq, kk, vv) = backend.fused_norm_qkv_qknorm(
                 hidden,
@@ -810,6 +816,33 @@ fn forward_layer(
         v = backend.execute(&Op::Add, &[&v, bias])?.remove(0);
     }
     acc_qkv_proj += t.elapsed().as_secs_f64() * 1000.0;
+
+    // Qwen3.5/3.8: split q_proj's double-width output into Q (everything
+    // below treats this as "q", unchanged) and the attention-output gate
+    // (held aside, no norm, no RoPE, applied after Sdpa and before
+    // o_proj, see below). PER-HEAD INTERLEAVED, not a global first-half/
+    // second-half split — HF's `q_proj(x).view(..., num_heads,
+    // head_dim*2)` then `chunk(2, dim=-1)` splits the LAST axis of a
+    // `[num_heads, head_dim*2]` view, so each head's raw output row is
+    // `[q(head_dim), gate(head_dim)]` back to back, repeated per head:
+    // `[h0_q, h0_gate, h1_q, h1_gate, ...]`. Getting this wrong (treating
+    // it as `[all_q, all_gate]`) is shape-compatible but numerically
+    // wrong — exactly the kind of bug a shape check can't catch.
+    let attn_gate: Option<Vec<f32>> = if is_gated_attn {
+        let full = q.to_f32_vec();
+        debug_assert_eq!(full.len(), 2 * num_heads * head_dim, "gated q_proj output must be exactly 2x num_heads*head_dim");
+        let mut query_part = vec![0f32; num_heads * head_dim];
+        let mut gate_part = vec![0f32; num_heads * head_dim];
+        for h in 0..num_heads {
+            let src = &full[h * 2 * head_dim..(h + 1) * 2 * head_dim];
+            query_part[h * head_dim..(h + 1) * head_dim].copy_from_slice(&src[..head_dim]);
+            gate_part[h * head_dim..(h + 1) * head_dim].copy_from_slice(&src[head_dim..]);
+        }
+        q = Tensor::from_f32(vec![1, num_heads * head_dim], query_part);
+        Some(gate_part)
+    } else {
+        None
+    };
 
     // QK-norm (Qwen3) — per-head RmsNorm. Batched: ONE command buffer for both.
     // Skipped if already done by fused_norm_qkv_qknorm above.
@@ -907,8 +940,12 @@ fn forward_layer(
     // GPU attention path is correct but currently slower in wall clock due to
     // 1 extra batch wait per layer. It's the foundation for cross-layer batching
     // (next step). Off by default — enable with MR_GPU_ATTN=1.
+    // `fused_attn_oproj_residual` runs o_proj internally with no hook to
+    // apply the Qwen3.5/3.8 attention-output gate in between — excluded
+    // until that path learns about it.
     let use_gpu_attn = backend.supports_gpu_attention()
         && !config.family.v_norm_per_head
+        && !is_gated_attn
         && layer.post_attn_norm.is_none()
         && std::env::var("MR_GPU_ATTN").is_ok();
     // Fused attention path returns hidden1 (post-residual) directly,
@@ -1026,6 +1063,17 @@ fn forward_layer(
         h1
     } else {
         let t = Instant::now();
+        // Qwen3.5/3.8: attn_output *= sigmoid(gate), BEFORE o_proj — the
+        // gate held aside when q_proj was split above.
+        let attn_tensor = if let Some(gate) = &attn_gate {
+            let mut data = attn_tensor.to_f32_vec();
+            for (v, g) in data.iter_mut().zip(gate.iter()) {
+                *v *= 1.0 / (1.0 + (-g).exp());
+            }
+            Tensor::from_f32(attn_tensor.shape.clone(), data)
+        } else {
+            attn_tensor
+        };
         let mut attn_proj = qw_matmul(&attn_tensor, &layer.o_proj, backend)?;
         if debug_l0 || debug_l1 {
             dbg_stats_l(layer_idx, "o_proj_out", &backend.download_f32(&attn_proj)?);
