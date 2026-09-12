@@ -232,6 +232,13 @@ pub struct HoneycrispBackend {
     /// Key = original Metal buffer address (stable, page-aligned).
     /// Value = transposed Q8 buffer [n_blocks, n_rows, 34] on GPU.
     transposed_down_w: std::sync::Mutex<TransposedCache>,
+    /// Lazily-built mRoPE pipelines, keyed by (head_dim, rope_dim) — bakes
+    /// both as MSL constants (same Metal-scheduler-regression avoidance as
+    /// every other kernel here). Qwen3.5/3.8 only, one geometry per model.
+    mrope_pipes: std::sync::Mutex<Vec<(usize, usize, HcPipeline)>>,
+    /// Lazily-built GatedDeltaNet recurrence-step pipelines, keyed by
+    /// (head_k_dim, head_v_dim).
+    gdn_pipes: std::sync::Mutex<Vec<(usize, usize, HcPipeline)>>,
 }
 
 struct TransposedCache(std::collections::HashMap<usize, Box<aruminium::Buffer>>);
@@ -406,7 +413,34 @@ impl HoneycrispBackend {
             scratch: BufferPool::new(),
             attn: std::sync::Mutex::new(Vec::new()),
             transposed_down_w: std::sync::Mutex::new(TransposedCache(std::collections::HashMap::new())),
+            mrope_pipes: std::sync::Mutex::new(Vec::new()),
+            gdn_pipes: std::sync::Mutex::new(Vec::new()),
         })
+    }
+
+    /// Lazily compile (and cache) the mRoPE pipeline for `(head_dim, rope_dim)`.
+    fn mrope_pipeline(&self, head_dim: usize, rope_dim: usize) -> Result<(), BackendError> {
+        let mut guard = self.mrope_pipes.lock().unwrap();
+        if guard.iter().any(|(hd, rd, _)| *hd == head_dim && *rd == rope_dim) {
+            return Ok(());
+        }
+        let msl = kernels::mrope::msl_for(head_dim, rope_dim);
+        let pipe = HcPipeline(self.device.pipeline(&msl)?);
+        guard.push((head_dim, rope_dim, pipe));
+        Ok(())
+    }
+
+    /// Lazily compile (and cache) the GatedDeltaNet recurrence-step
+    /// pipeline for `(head_k_dim, head_v_dim)`.
+    fn gdn_pipeline(&self, head_k_dim: usize, head_v_dim: usize) -> Result<(), BackendError> {
+        let mut guard = self.gdn_pipes.lock().unwrap();
+        if guard.iter().any(|(hk, hv, _)| *hk == head_k_dim && *hv == head_v_dim) {
+            return Ok(());
+        }
+        let msl = kernels::gated_delta::msl_for(head_k_dim, head_v_dim);
+        let pipe = HcPipeline(self.device.pipeline(&msl)?);
+        guard.push((head_k_dim, head_v_dim, pipe));
+        Ok(())
     }
 
     /// Lazily build attention state. Geometry change → full reset (drops cache).
@@ -697,7 +731,7 @@ impl Backend for HoneycrispBackend {
         let q4 = matches!(o_proj_w.dtype, DType::Q4);
         let on_gpu = matches!(o_proj_w.data, TensorData::Backend(_));
         if !(q8 || q4) || !on_gpu || hidden_in.dtype != DType::F32 {
-            return Backend::fused_attn_oproj_residual(
+            return crate::backend::fallback_fused_attn_oproj_residual(
                 self, q, k, v, hidden_in, o_proj_w,
                 layer_idx, position,
                 num_heads, kv_heads, head_dim, max_seq, scale, window,
@@ -974,6 +1008,80 @@ impl Backend for HoneycrispBackend {
         let result = self.wrap_output(out_buf, vec![1, (num_heads * head_dim) as usize], DType::F32);
 
         Ok(result)
+    }
+
+    fn apply_mrope_cos_sin(
+        &self,
+        x: &Tensor,
+        cos: &[f32],
+        sin: &[f32],
+        head_dim: usize,
+        rope_dim: usize,
+    ) -> Result<Tensor, BackendError> {
+        self.mrope_pipeline(head_dim, rope_dim)?;
+        let guard = self.mrope_pipes.lock().unwrap();
+        let (_, _, pipe) = guard
+            .iter()
+            .find(|(hd, rd, _)| *hd == head_dim && *rd == rope_dim)
+            .expect("mrope_pipeline just inserted this geometry");
+        let n_rows = (x.numel() / head_dim) as u32;
+        let x_buf = self.buf_ref(x)?;
+        let cos_buf = self.device.gpu.buffer_with_data(bytemuck::cast_slice(cos))
+            .map_err(|e| BackendError::Internal(format!("mrope cos upload: {e}")))?;
+        let sin_buf = self.device.gpu.buffer_with_data(bytemuck::cast_slice(sin))
+            .map_err(|e| BackendError::Internal(format!("mrope sin upload: {e}")))?;
+        let out_buf = kernels::mrope::dispatch(
+            &self.device, &pipe.0, x_buf.as_buffer(), &cos_buf, &sin_buf,
+            n_rows, head_dim as u32,
+        )?;
+        Ok(self.wrap_output(out_buf, x.shape.clone(), DType::F32))
+    }
+
+    fn gated_delta_recurrence_step(
+        &self,
+        state: &mut [f32],
+        q_t: &[f32],
+        k_t: &[f32],
+        v_t: &[f32],
+        decay: &[f32],
+        beta: &[f32],
+        num_heads: usize,
+        head_k_dim: usize,
+        head_v_dim: usize,
+    ) -> Result<Vec<f32>, BackendError> {
+        self.gdn_pipeline(head_k_dim, head_v_dim)?;
+        let guard = self.gdn_pipes.lock().unwrap();
+        let (_, _, pipe) = guard
+            .iter()
+            .find(|(hk, hv, _)| *hk == head_k_dim && *hv == head_v_dim)
+            .expect("gdn_pipeline just inserted this geometry");
+
+        let state_buf = self.device.gpu.buffer_with_data(bytemuck::cast_slice(state))
+            .map_err(|e| BackendError::Internal(format!("gdn state upload: {e}")))?;
+        let q_buf = self.device.gpu.buffer_with_data(bytemuck::cast_slice(q_t))
+            .map_err(|e| BackendError::Internal(format!("gdn q upload: {e}")))?;
+        let k_buf = self.device.gpu.buffer_with_data(bytemuck::cast_slice(k_t))
+            .map_err(|e| BackendError::Internal(format!("gdn k upload: {e}")))?;
+        let v_buf = self.device.gpu.buffer_with_data(bytemuck::cast_slice(v_t))
+            .map_err(|e| BackendError::Internal(format!("gdn v upload: {e}")))?;
+        let decay_buf = self.device.gpu.buffer_with_data(bytemuck::cast_slice(decay))
+            .map_err(|e| BackendError::Internal(format!("gdn decay upload: {e}")))?;
+        let beta_buf = self.device.gpu.buffer_with_data(bytemuck::cast_slice(beta))
+            .map_err(|e| BackendError::Internal(format!("gdn beta upload: {e}")))?;
+
+        let out_buf = kernels::gated_delta::dispatch(
+            &self.device, &pipe.0,
+            &state_buf, &q_buf, &k_buf, &v_buf, &decay_buf, &beta_buf,
+            num_heads as u32, head_v_dim as u32,
+        )?;
+
+        // state was mutated in place on the GPU side — read it back into
+        // the caller's buffer (this method's contract: read-modify-write).
+        let state_len = state.len();
+        state_buf.read_f32(|s| state.copy_from_slice(&s[..state_len]));
+        let out_len = num_heads * head_v_dim;
+        let out = out_buf.read_f32(|o| o[..out_len].to_vec());
+        Ok(out)
     }
 
     fn supports(&self, op: &Op, inputs: &[&Tensor]) -> bool {
@@ -1328,7 +1436,7 @@ impl Backend for HoneycrispBackend {
             || hidden.dtype != DType::F32 || input_norm_gamma.dtype != DType::F32
             || q_norm_gamma.dtype != DType::F32 || k_norm_gamma.dtype != DType::F32
         {
-            return Backend::fused_norm_qkv_qknorm(
+            return crate::backend::fallback_fused_norm_qkv_qknorm(
                 self, hidden, input_norm_gamma,
                 q_proj_w, k_proj_w, v_proj_w,
                 q_norm_gamma, k_norm_gamma,
@@ -1510,7 +1618,7 @@ impl Backend for HoneycrispBackend {
         if !weights_q8 || !weights_on_gpu || !k_match || !aligned
             || hidden.dtype != DType::F32 || post_norm_gamma.dtype != DType::F32
         {
-            return Backend::fused_norm_swiglu_down(
+            return crate::backend::fallback_fused_norm_swiglu_down(
                 self, hidden, post_norm_gamma, gate_w, up_w, down_w, eps,
             );
         }
@@ -1662,7 +1770,7 @@ impl Backend for HoneycrispBackend {
         if !q_ok || !on_gpu || hidden_in.dtype != DType::F32
             || post_norm_gamma.dtype != DType::F32
         {
-            return Backend::fused_ffn_residual(
+            return crate::backend::fallback_fused_ffn_residual(
                 self, hidden_in, post_norm_gamma, gate_w, up_w, down_w, eps,
             );
         }
@@ -1703,7 +1811,7 @@ impl Backend for HoneycrispBackend {
         if (gate_w.shape[1] as u32) != d || (up_w.shape[1] as u32) != d
             || (down_w.shape[1] as u32) != inter
         {
-            return Backend::fused_ffn_residual(self, hidden_in, post_norm_gamma, gate_w, up_w, down_w, eps);
+            return crate::backend::fallback_fused_ffn_residual(self, hidden_in, post_norm_gamma, gate_w, up_w, down_w, eps);
         }
 
         let h_buf = self.buf_ref(hidden_in)?;
@@ -2740,7 +2848,7 @@ impl Backend for HoneycrispBackend {
         // All inputs must be f32 (host or backend). If any quantized, fall back.
         let supported = pairs.iter().all(|(x, g)| x.dtype == DType::F32 && g.dtype == DType::F32);
         if !supported {
-            return Backend::rms_norm_multi(self, pairs, eps);
+            return crate::backend::fallback_rms_norm_multi(self, pairs, eps);
         }
 
         // Resolve buf refs and allocate outputs.
@@ -2819,7 +2927,7 @@ impl Backend for HoneycrispBackend {
         });
         let weights_on_gpu = ws.iter().all(|w| matches!(w.data, TensorData::Backend(_)));
         if !supported || !weights_on_gpu || x.dtype != DType::F32 || gamma.dtype != DType::F32 {
-            return Backend::fused_norm_quant_matmul_multi(self, x, gamma, eps, ws);
+            return crate::backend::fallback_fused_norm_quant_matmul_multi(self, x, gamma, eps, ws);
         }
 
         let batch = x.shape[..x.shape.len() - 1].iter().product::<usize>() as u32;

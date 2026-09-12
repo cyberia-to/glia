@@ -222,9 +222,7 @@ pub trait Backend: Send + Sync {
         pairs: &[(&Tensor, &Tensor)],
         eps: f32,
     ) -> Result<Vec<Tensor>, BackendError> {
-        pairs.iter()
-            .map(|(x, g)| self.execute(&crate::core::op::Op::RmsNorm { eps }, &[x, g]).map(|mut v| v.remove(0)))
-            .collect()
+        fallback_rms_norm_multi(self, pairs, eps)
     }
 
     /// Fused RmsNorm followed by N quant matmuls against the normalized output.
@@ -237,9 +235,7 @@ pub trait Backend: Send + Sync {
         eps: f32,
         ws: &[&Tensor],
     ) -> Result<Vec<Tensor>, BackendError> {
-        let normed = self.execute(&crate::core::op::Op::RmsNorm { eps }, &[x, gamma])?
-            .remove(0);
-        self.quant_matmul_multi(&normed, ws)
+        fallback_fused_norm_quant_matmul_multi(self, x, gamma, eps, ws)
     }
 
     /// Fused: RmsNorm(hidden) → q_proj/k_proj/v_proj → qk_norm(Q)/qk_norm(K).
@@ -259,27 +255,10 @@ pub trait Backend: Send + Sync {
         num_k_heads: usize,
         head_dim: usize,
     ) -> Result<(Tensor, Tensor, Tensor), BackendError> {
-        let qkv = self.fused_norm_quant_matmul_multi(
-            hidden, input_norm_gamma, eps, &[q_proj_w, k_proj_w, v_proj_w],
-        )?;
-        let mut it = qkv.into_iter();
-        let q = it.next().unwrap();
-        let k = it.next().unwrap();
-        let v = it.next().unwrap();
-        // Reshape q/k for per-head norm. For host tensors this is metadata-only.
-        let q_reshaped = Tensor { shape: vec![num_q_heads, head_dim], dtype: q.dtype, data: q.data };
-        let k_reshaped = Tensor { shape: vec![num_k_heads, head_dim], dtype: k.dtype, data: k.data };
-        let normed = self.rms_norm_multi(
-            &[(&q_reshaped, q_norm_gamma), (&k_reshaped, k_norm_gamma)],
-            eps,
-        )?;
-        let mut nit = normed.into_iter();
-        let q_n = nit.next().unwrap();
-        let k_n = nit.next().unwrap();
-        // Reshape back
-        let q_flat = Tensor { shape: vec![1, num_q_heads * head_dim], dtype: q_n.dtype, data: q_n.data };
-        let k_flat = Tensor { shape: vec![1, num_k_heads * head_dim], dtype: k_n.dtype, data: k_n.data };
-        Ok((q_flat, k_flat, v))
+        fallback_fused_norm_qkv_qknorm(
+            self, hidden, input_norm_gamma, q_proj_w, k_proj_w, v_proj_w,
+            q_norm_gamma, k_norm_gamma, eps, num_q_heads, num_k_heads, head_dim,
+        )
     }
 
     /// True if backend can compute scaled-dot-product attention with its own
@@ -330,13 +309,10 @@ pub trait Backend: Send + Sync {
         scale: f32,
         window: u32,
     ) -> Result<Tensor, BackendError> {
-        let attn = self.gpu_attention(
-            q, k, v, layer_idx, position,
+        fallback_fused_attn_oproj_residual(
+            self, q, k, v, hidden_in, o_proj_w, layer_idx, position,
             num_heads, kv_heads, head_dim, max_seq, scale, window,
-        )?;
-        let attn_proj = self.quant_matmul(&attn, o_proj_w)?;
-        self.execute(&crate::core::op::Op::Add, &[hidden_in, &attn_proj])
-            .map(|mut v| v.remove(0))
+        )
     }
 
     /// Fused FFN block: post_norm + gate + up + silu*up + down + residual_add.
@@ -351,11 +327,7 @@ pub trait Backend: Send + Sync {
         down_w: &Tensor,
         eps: f32,
     ) -> Result<Tensor, BackendError> {
-        let ffn_out = self.fused_norm_swiglu_down(
-            hidden_in, post_norm_gamma, gate_w, up_w, down_w, eps,
-        )?;
-        self.execute(&crate::core::op::Op::Add, &[hidden_in, &ffn_out])
-            .map(|mut v| v.remove(0))
+        fallback_fused_ffn_residual(self, hidden_in, post_norm_gamma, gate_w, up_w, down_w, eps)
     }
 
     /// Fused FFN: post_norm(hidden) → gate, up → silu(gate)*up → down_proj.
@@ -369,14 +341,7 @@ pub trait Backend: Send + Sync {
         down_w: &Tensor,
         eps: f32,
     ) -> Result<Tensor, BackendError> {
-        let gate_up = self.fused_norm_quant_matmul_multi(
-            hidden, post_norm_gamma, eps, &[gate_w, up_w],
-        )?;
-        let mut it = gate_up.into_iter();
-        let gate = it.next().unwrap();
-        let up = it.next().unwrap();
-        let mid = self.silu_mul(&gate, &up)?;
-        self.quant_matmul(&mid, down_w)
+        fallback_fused_norm_swiglu_down(self, hidden, post_norm_gamma, gate_w, up_w, down_w, eps)
     }
 
     /// Run all transformer layers in a single GPU command buffer (decode mode).
@@ -398,6 +363,77 @@ pub trait Backend: Send + Sync {
     /// Fused SiLU(gate) * up. Default: split into two ops on CPU.
     /// GPU backends override with a single kernel — half the memory bandwidth
     /// and a single dispatch instead of two.
+    /// Qwen3.5/3.8 interleaved-mRoPE Q/K rotation — contiguous `rope_dim`
+    /// prefix rotated (own `rotate_half`, split at `rope_dim/2`), the
+    /// `head_dim - rope_dim` tail passed through unchanged. NOT the same
+    /// index convention as `Op::Rope` (built for Gemma-4's interleaved-
+    /// pairs-across-full-head_dim scheme) — see
+    /// `backend::cpu::mrope::apply_rope_cos_sin_f32`'s doc comment and
+    /// ops.md §"mRoPE, interleaved". `x`: `[n_rows, head_dim]`. `cos`/
+    /// `sin`: `[rope_dim]`, one token's precomputed frequencies
+    /// (duplicated across the two halves — `mrope_cos_sin`'s output).
+    /// Default: CPU reference. GPU backends override with a kernel.
+    fn apply_mrope_cos_sin(
+        &self,
+        x: &Tensor,
+        cos: &[f32],
+        sin: &[f32],
+        head_dim: usize,
+        rope_dim: usize,
+    ) -> Result<Tensor, BackendError> {
+        let x_data = if let Some(b) = x.as_host_bytes() {
+            bytemuck::cast_slice::<u8, f32>(b).to_vec()
+        } else {
+            self.download_f32(x)?
+        };
+        let out = crate::backend::cpu::mrope::apply_rope_cos_sin_f32(&x_data, cos, sin, head_dim, rope_dim);
+        Ok(Tensor::from_f32(x.shape.clone(), out))
+    }
+
+    /// GatedDeltaNet's per-head delta-rule recurrence step (ops.md
+    /// §"GatedDeltaNet") — decay `state` in place, rank-1-update it
+    /// from `(q_t, k_t, v_t, decay, beta)`, return this token's output.
+    /// `state`: `[num_heads, head_k_dim, head_v_dim]`, READ-MODIFY-
+    /// WRITE. `q_t`/`k_t`: `[num_heads, head_k_dim]`. `v_t`:
+    /// `[num_heads, head_v_dim]`. `decay`/`beta`: `[num_heads]`. Same
+    /// math as `backend::cpu::gated_delta::recurrence_step`, one call
+    /// per head there — batched over all heads here so a GPU backend
+    /// can parallelize across the whole `num_heads * head_v_dim` grid
+    /// in one dispatch. Returns `[num_heads, head_v_dim]`.
+    ///
+    /// Default: CPU reference, one `recurrence_step` call per head.
+    /// GPU backends override with a persistent-state kernel.
+    fn gated_delta_recurrence_step(
+        &self,
+        state: &mut [f32],
+        q_t: &[f32],
+        k_t: &[f32],
+        v_t: &[f32],
+        decay: &[f32],
+        beta: &[f32],
+        num_heads: usize,
+        head_k_dim: usize,
+        head_v_dim: usize,
+    ) -> Result<Vec<f32>, BackendError> {
+        let mut out = vec![0f32; num_heads * head_v_dim];
+        for hi in 0..num_heads {
+            let st = &mut state[hi * head_k_dim * head_v_dim..(hi + 1) * head_k_dim * head_v_dim];
+            let out_row = &mut out[hi * head_v_dim..(hi + 1) * head_v_dim];
+            crate::backend::cpu::gated_delta::recurrence_step(
+                st,
+                &q_t[hi * head_k_dim..(hi + 1) * head_k_dim],
+                &k_t[hi * head_k_dim..(hi + 1) * head_k_dim],
+                &v_t[hi * head_v_dim..(hi + 1) * head_v_dim],
+                decay[hi],
+                beta[hi],
+                head_k_dim,
+                head_v_dim,
+                out_row,
+            );
+        }
+        Ok(out)
+    }
+
     fn silu_mul(&self, gate: &Tensor, up: &Tensor) -> Result<Tensor, BackendError> {
         // Default falls back to host f32 path.
         let g = if let Some(b) = gate.as_host_bytes() {
@@ -415,4 +451,136 @@ pub trait Backend: Send + Sync {
             .collect();
         Ok(Tensor::from_f32(gate.shape.clone(), out))
     }
+}
+
+// ── unfused fallbacks ────────────────────────────────────────────────────────
+//
+// The composed-of-smaller-ops bodies of the fused trait methods, as free
+// functions, so an *implementation* whose fast path is ineligible can reach
+// them. They used to live only as trait default bodies, and a backend that
+// wrote `return Backend::method(self, ...)` to "call the default" was in fact
+// calling its own override — infinite tail recursion, which LLVM dutifully
+// turned into a branch-to-self. soma's mind spun exactly there for as long as
+// anyone cared to wait, at 99% CPU, three frames deep into the first layer of
+// the first token of any model whose weights had not been uploaded yet.
+
+pub fn fallback_rms_norm_multi<B: Backend + ?Sized>(
+    b: &B,
+    pairs: &[(&Tensor, &Tensor)],
+    eps: f32,
+) -> Result<Vec<Tensor>, BackendError> {
+    pairs.iter()
+        .map(|(x, g)| b.execute(&crate::core::op::Op::RmsNorm { eps }, &[x, g]).map(|mut v| v.remove(0)))
+        .collect()
+}
+
+pub fn fallback_fused_norm_quant_matmul_multi<B: Backend + ?Sized>(
+    b: &B,
+    x: &Tensor,
+    gamma: &Tensor,
+    eps: f32,
+    ws: &[&Tensor],
+) -> Result<Vec<Tensor>, BackendError> {
+    let normed = b.execute(&crate::core::op::Op::RmsNorm { eps }, &[x, gamma])?
+        .remove(0);
+    b.quant_matmul_multi(&normed, ws)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn fallback_fused_norm_qkv_qknorm<B: Backend + ?Sized>(
+    b: &B,
+    hidden: &Tensor,
+    input_norm_gamma: &Tensor,
+    q_proj_w: &Tensor,
+    k_proj_w: &Tensor,
+    v_proj_w: &Tensor,
+    q_norm_gamma: &Tensor,
+    k_norm_gamma: &Tensor,
+    eps: f32,
+    num_q_heads: usize,
+    num_k_heads: usize,
+    head_dim: usize,
+) -> Result<(Tensor, Tensor, Tensor), BackendError> {
+    let qkv = b.fused_norm_quant_matmul_multi(
+        hidden, input_norm_gamma, eps, &[q_proj_w, k_proj_w, v_proj_w],
+    )?;
+    let mut it = qkv.into_iter();
+    let q = it.next().unwrap();
+    let k = it.next().unwrap();
+    let v = it.next().unwrap();
+    // Reshape q/k for per-head norm. For host tensors this is metadata-only.
+    let q_reshaped = Tensor { shape: vec![num_q_heads, head_dim], dtype: q.dtype, data: q.data };
+    let k_reshaped = Tensor { shape: vec![num_k_heads, head_dim], dtype: k.dtype, data: k.data };
+    let normed = b.rms_norm_multi(
+        &[(&q_reshaped, q_norm_gamma), (&k_reshaped, k_norm_gamma)],
+        eps,
+    )?;
+    let mut nit = normed.into_iter();
+    let q_n = nit.next().unwrap();
+    let k_n = nit.next().unwrap();
+    // Reshape back
+    let q_flat = Tensor { shape: vec![1, num_q_heads * head_dim], dtype: q_n.dtype, data: q_n.data };
+    let k_flat = Tensor { shape: vec![1, num_k_heads * head_dim], dtype: k_n.dtype, data: k_n.data };
+    Ok((q_flat, k_flat, v))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn fallback_fused_attn_oproj_residual<B: Backend + ?Sized>(
+    b: &B,
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    hidden_in: &Tensor,
+    o_proj_w: &Tensor,
+    layer_idx: usize,
+    position: usize,
+    num_heads: u32,
+    kv_heads: u32,
+    head_dim: u32,
+    max_seq: u32,
+    scale: f32,
+    window: u32,
+) -> Result<Tensor, BackendError> {
+    let attn = b.gpu_attention(
+        q, k, v, layer_idx, position,
+        num_heads, kv_heads, head_dim, max_seq, scale, window,
+    )?;
+    let attn_proj = b.quant_matmul(&attn, o_proj_w)?;
+    b.execute(&crate::core::op::Op::Add, &[hidden_in, &attn_proj])
+        .map(|mut v| v.remove(0))
+}
+
+pub fn fallback_fused_ffn_residual<B: Backend + ?Sized>(
+    b: &B,
+    hidden_in: &Tensor,
+    post_norm_gamma: &Tensor,
+    gate_w: &Tensor,
+    up_w: &Tensor,
+    down_w: &Tensor,
+    eps: f32,
+) -> Result<Tensor, BackendError> {
+    let ffn_out = b.fused_norm_swiglu_down(
+        hidden_in, post_norm_gamma, gate_w, up_w, down_w, eps,
+    )?;
+    b.execute(&crate::core::op::Op::Add, &[hidden_in, &ffn_out])
+        .map(|mut v| v.remove(0))
+}
+
+pub fn fallback_fused_norm_swiglu_down<B: Backend + ?Sized>(
+    b: &B,
+    hidden: &Tensor,
+    post_norm_gamma: &Tensor,
+    gate_w: &Tensor,
+    up_w: &Tensor,
+    down_w: &Tensor,
+    eps: f32,
+) -> Result<Tensor, BackendError> {
+    let gate_up = b.fused_norm_quant_matmul_multi(
+        hidden, post_norm_gamma, eps, &[gate_w, up_w],
+    )?;
+    let mut it = gate_up.into_iter();
+    let gate = it.next().unwrap();
+    let up = it.next().unwrap();
+    let mid = b.silu_mul(&gate, &up)?;
+    b.quant_matmul(&mid, down_w)
 }

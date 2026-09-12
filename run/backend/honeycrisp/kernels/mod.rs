@@ -2,7 +2,9 @@
 
 pub mod attention;
 pub mod elementwise;
+pub mod gated_delta;
 pub mod matmul;
+pub mod mrope;
 pub mod q4_matmul;
 pub mod q4k_matmul;
 pub mod q6k_matmul;
