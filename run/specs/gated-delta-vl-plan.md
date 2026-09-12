@@ -311,6 +311,68 @@ Landed on top of the Progress section above:
   a bigger architectural change than this session's scope, trading
   memory for reading the file from disk/mmap on every token.
 
+## VL / vision tower — scoped from source, not started (2026-09-12)
+
+Traced the real implementation (transformers 5.17.0, same venv as
+GatedDeltaNet's verification) rather than guessing. This is bigger than
+"a plain ViT" — it's the same "naive dynamic resolution" family as
+Qwen2-VL/Qwen2.5-VL, not a fixed-grid encoder. Five real primitives,
+none of which exist in this runtime today:
+
+1. **3D-conv patch embed** (`Qwen3_5VisionPatchEmbed`, modeling_qwen3_5.py
+   ~961): `nn.Conv3d(in_channels, hidden, kernel=[temporal_patch,
+   patch, patch], stride=same)` — treats a still image as a 1-frame
+   clip. Tensor names: `model.visual.patch_embed.proj.{weight,bias}`.
+2. **Learned position embeddings, bilinearly resampled per image**
+   (`Qwen3_5VisionModel.forward`, ~1195; the resampling itself is
+   `get_vision_interpolation_indices_and_weights` in the SHARED
+   `transformers/vision_utils.py:231` — not in the model file). A
+   square `num_position_embeddings`-entry table gets bilinear-
+   interpolated to each image's actual (h, w) grid, weighted-summed
+   (`(pos_embed(idx) * weight[:,:,None]).sum(1)`), then added to the
+   patch embeddings. Tensor: `model.visual.pos_embed.weight`.
+3. **Vision RoPE** (`Qwen3_5VisionRotaryEmbedding`, ~77; position ids
+   from `get_vision_position_ids`, `vision_utils.py:81`) — axial 2D:
+   same freq table for H and W, head_dim//4 each, concatenated;
+   position INDICES are block-major over `spatial_merge_size ×
+   spatial_merge_size` blocks (not row-major over the raw grid) — get
+   this wrong and every downstream number is subtly off, not a crash.
+4. **Packed variable-length attention** (`Qwen3_5VisionAttention`,
+   ~1011; boundaries from `get_vision_attention_seqlens`,
+   `vision_utils.py:68`) — every image/frame in the batch is its own
+   attention segment via `cu_seqlens` (no causal mask, bidirectional
+   within a segment, zero cross-segment attention). Tensor names:
+   `model.visual.blocks.N.attn.{qkv,proj}.{weight,bias}`,
+   `model.visual.blocks.N.norm{1,2}.{weight,bias}` (LayerNorm, not
+   RmsNorm — a first for this codebase's vision path), `.mlp.linear_fc{1,2}`.
+5. **Patch merger** (`Qwen3_5VisionPatchMerger`, ~981): LayerNorm →
+   Linear → GELU → Linear, projecting `spatial_merge_size²`-grouped
+   patches into the LM's `out_hidden_size` — this is what actually
+   produces the image tokens that replace `image_token_id` placeholders
+   in the text stream. Tensor names: `model.visual.merger.norm.*`,
+   `.linear_fc{1,2}.*`.
+
+**Fusion into the text stream** (not yet traced at all): where exactly
+`image_token_id` placeholders in the tokenized prompt get replaced by
+`merger` output, and how multiple images/videos of different grid
+sizes interleave — this is a SIXTH piece, in `Qwen3_5Model.forward`
+(the top-level multimodal wrapper), not yet read.
+
+**Why this wasn't attempted this session**: every one of the 5+1 pieces
+is genuinely novel to this runtime (no existing CausalConv3d, no
+bilinear interpolation op, no block-major position indexing, no
+packed/segmented attention, no LayerNorm-based vision block — every
+existing block in this codebase is RmsNorm) and needs its own golden
+test against real preprocessed image tensors — which requires tracing
+the image PREPROCESSOR too (`preprocessor_config.json`,
+`video_preprocessor_config.json` — read but not analyzed) to produce
+a correct `(hidden_states, grid_thw)` pair to test against, not just
+the model weights. This is comparable in size to the entire
+GatedDeltaNet effort above, or larger, and deserves its own dedicated
+pass with the same rigor (spec first, CPU reference, golden test
+against real weights) rather than a rushed partial implementation in
+the tail of an already-long session.
+
 ## Effort
 
 Real, multi-session work — not a config tweak. Steps 1+3 are small
