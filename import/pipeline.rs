@@ -191,20 +191,43 @@ pub fn import_snapshot(
     // Per-kind RoPE (Gemma-4): rope_parameters.{full_attention, sliding_attention}.
     // Flat rope_theta is the LlamaStyle / Gemma-3 case; the nested form
     // extracts sliding's theta here and full's theta+partial_rotary later.
+    //
+    // Qwen3.5/3.8 is a THIRD shape: rope_parameters is itself flat (no
+    // full_attention/sliding_attention sub-keys) but still carries
+    // rope_theta/partial_rotary_factor that apply to whichever layer kind
+    // actually calls RoPE — for this family that's `full_attention`
+    // (Sdpa) only, since `linear_attention` (GatedDeltaNet) layers never
+    // rotate at all. Route this flat dict's values into the SAME
+    // `_full` fields Gemma-4 uses, so `layer_rope_theta`/`layer_rope_dim`
+    // apply them correctly without a third code path. Missing this
+    // (pre-2026-09-12) silently ran Qwen3.8's full_attention layers with
+    // rope_theta=10000 and full head_dim rotation instead of the real
+    // 10_000_000 / 64-of-256 partial rotary — wrong numbers, no crash.
     let rope_params = text_config.get("rope_parameters");
     let rope_sliding = rope_params.and_then(|p| p.get("sliding_attention"));
     let rope_full = rope_params.and_then(|p| p.get("full_attention"));
+    let rope_flat = rope_params.filter(|p| {
+        p.get("sliding_attention").is_none() && p.get("full_attention").is_none()
+    });
     let rope_theta = rope_sliding
         .and_then(|s| s.get("rope_theta"))
         .and_then(|v| v.as_f64())
         .or_else(|| text_config["rope_theta"].as_f64())
+        .or_else(|| rope_flat.and_then(|p| p.get("rope_theta")).and_then(|v| v.as_f64()))
         .unwrap_or(10000.0);
     let rope_theta_full = rope_full
         .and_then(|f| f.get("rope_theta"))
-        .and_then(|v| v.as_f64());
+        .and_then(|v| v.as_f64())
+        .or_else(|| rope_flat.and_then(|p| p.get("rope_theta")).and_then(|v| v.as_f64()));
     let partial_rotary_factor_full = rope_full
         .and_then(|f| f.get("partial_rotary_factor"))
-        .and_then(|v| v.as_f64());
+        .and_then(|v| v.as_f64())
+        .or_else(|| {
+            rope_flat
+                .and_then(|p| p.get("partial_rotary_factor"))
+                .and_then(|v| v.as_f64())
+        })
+        .or_else(|| text_config["partial_rotary_factor"].as_f64());
     let rms_norm_eps = text_config["rms_norm_eps"].as_f64().unwrap_or(1e-6);
     let tie_word_embeddings = text_config["tie_word_embeddings"]
         .as_bool()

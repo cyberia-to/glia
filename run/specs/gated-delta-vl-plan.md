@@ -405,10 +405,8 @@ the spec too — written before this was checked against source this
 carefully).
 
 Still open, per ops.md's "Not yet done" note:
-- **Fusion into the text stream**: `image_token_id` placeholder
-  replacement + multi-image/video position-id bookkeeping in
-  `Qwen3_5Model.forward` — IDs and the 1:1 replacement contract are
-  recorded, exact splice mechanics are not traced.
+- **Fusion into the text stream**: see the dedicated progress entry
+  below — mechanics now fully traced, not yet implemented.
 - **Image preprocessor**: turning a real image file into
   `pixel_values` + `grid_thw` (resize, normalize, patchify) — the
   golden test above uses synthetic-but-correctly-shaped patches, not
@@ -418,3 +416,130 @@ Still open, per ops.md's "Not yet done" note:
 - **Memory ceiling for the full 27B model**: EXPLICITLY DEFERRED by
   the user to a future dedicated "night session when nothing else is
   running on the machine" — not attempted again this session.
+
+## Progress — 2026-09-12, real rope_theta/partial_rotary_factor import bug found + fixed
+
+While tracing the text-stream fusion mechanics (below), pulled the real
+`Qwen3_5TextConfig` for both downloaded models to get exact mRoPE
+numbers and found the importer had been silently mis-extracting RoPE
+config for BOTH of them, not just the new 27B model:
+
+- `heretic-org/Qwen3.8-27B-heretic-ara`: real `rope_parameters =
+  {rope_theta: 10000000, partial_rotary_factor: 0.25, mrope_section:
+  [11,11,10], mrope_interleaved: true, rope_type: "default"}`. The
+  importer's Gemma-4 code path only reads `rope_parameters.
+  full_attention.rope_theta`/`.partial_rotary_factor` — Qwen3.5/3.8's
+  `rope_parameters` is FLAT (no per-kind sub-dicts, because only
+  `full_attention` layers ever call RoPE — `linear_attention`
+  GatedDeltaNet layers never rotate), so neither field was extracted:
+  `rope_theta_full`/`partial_rotary_factor_full` were silently absent,
+  and the base `rope_theta` fallback defaulted to 10000.0. The model's
+  16 real full_attention layers were about to run with a 1000x wrong
+  RoPE base and full head_dim (256) rotation instead of the real
+  partial rotary (64 of 256 dims) — wrong numbers, no crash, nothing
+  in a shape check would have caught it.
+- `p-e-w/Qwen3-8B-heretic` (the "already in-family, no new work"
+  baseline model, imported and byte-verified earlier this session):
+  real `rope_parameters = {rope_theta: 1000000, rope_type: "default"}`
+  — same flat shape, no partial rotary this time (regular Qwen3, not
+  3.5/3.8), but the SAME missing-fallback bug meant this model's
+  `rope_theta` was ALSO silently defaulting to 10000.0 instead of the
+  real 1000000 — for EVERY layer, since all 36 are `full_attention`.
+  This had been wrong since the model was first imported
+  (2026-09-11) and nothing in this session's testing had caught it —
+  the earlier "byte-identical regression check" only verified the
+  import pipeline's I/O refactor didn't change output for a given
+  (buggy) config extraction, not that the extraction was correct.
+
+Fixed in `import/pipeline.rs`: added a `rope_flat` fallback — when
+`rope_parameters` has neither `sliding_attention` nor `full_attention`
+sub-keys, its `rope_theta`/`partial_rotary_factor` route into the same
+`rope_theta_full`/`partial_rotary_factor_full` fields Gemma-4's nested
+shape uses (correct because in every family that has this flat shape,
+the non-"full" layer kind never calls RoPE at all — see `format.md`'s
+new "Two different source JSON shapes" note). Spec updated first
+(`run/specs/format.md`), then the fix, then both models re-imported:
+
+- `qwen3-8b-heretic.model`: re-imported, confirmed `rope_theta = 1000000`
+  (was `10000`) in the packed config. Old file kept as
+  `qwen3-8b-heretic.model.bak-wrong-rope-theta` for reference. Smoke-
+  tested both old and new on the same short factual prompt
+  (`--max-tokens 40`, greedy) — identical output for this prompt; the
+  divergence is real (confirmed by direct config comparison against
+  the real HF config, not inferred from output) but a 1000x theta
+  difference doesn't necessarily flip greedy argmax within the first
+  40 tokens of a short factual answer. Did not attempt a longer/more
+  sensitive test — the fix is verified by config correctness, not by
+  hunting for an input that visibly breaks under the old bug.
+- `qwen3.8-27b-heretic.model`: re-imported (in progress / done by the
+  time this is read), confirmed `rope_theta_full = 10000000` and
+  `partial_rotary_factor_full = 0.25` now present in the packed
+  config.
+
+## Progress — 2026-09-12, text-stream fusion mechanics fully traced
+
+Read `Qwen3_5Model.forward`/`get_image_features`/`get_placeholder_mask`/
+`compute_3d_position_ids`/`get_rope_index`/`get_vision_position_ids`
+(modeling_qwen3_5.py:1326-1670) end to end. This is the piece ops.md
+flagged as "not yet traced." Full mechanics, verified against source
+(and against the real config's actual field values via a live
+`Qwen3_5TextConfig(**text_config)` instantiation — not guessed):
+
+1. **Splice**: `image_embeds = visual(pixel_values, grid_thw).pooler_output`
+   (one row per merge-group, exactly the vision tower's own output —
+   already implemented and golden-tested), split per-image by
+   `grid_thw.prod(-1) // spatial_merge_size²` token counts, concatenated,
+   then `inputs_embeds.masked_scatter(image_mask, image_embeds)` where
+   `image_mask = (input_ids == image_token_id)` — a 1:1, in-order
+   replacement: token embeddings at `image_token_id` positions become
+   the corresponding vision-tower output rows, nothing more clever than
+   an ordered copy.
+2. **mRoPE is mandatory once an image is present, not optional.** Qwen3.8's
+   text decoder's `full_attention` layers use INTERLEAVED 3D mRoPE
+   (`mrope_section=[11,11,10]` pairs, `mrope_interleaved=true` — a step-3
+   interleave: `freq[..., offset::3]` per axis, NOT Qwen2-VL's older
+   block-concatenated split). `linear_attention` (GatedDeltaNet) layers
+   never call RoPE at all — mRoPE only affects the 16 real
+   full_attention layers, same as the rope_theta/partial_rotary_factor
+   bug above. Without `mm_token_type_ids`, HF's `compute_3d_position_ids`
+   RAISES (multimodal input requires it) — there is no silent fallback
+   to plain 1D positions once `image_grid_thw` is non-null.
+3. **`get_rope_index`** (the actual 3D position id builder): walks the
+   token sequence, grouping consecutive runs by modality
+   (text=0/image=1/video=2, from `mm_token_type_ids`). Text runs get
+   plain sequential `(t,h,w)=(i,i,i)` continuing from a running
+   `current_pos` counter. Vision runs get `get_vision_position_ids`
+   (a DIFFERENT function from the vision tower's own internal one of
+   the same name in `vision_utils.py` — this one is `Qwen3_5Model`'s
+   own method, operating on the POST-merge low-res `llm_grid_h ×
+   llm_grid_w` grid): `T_grid,H_grid,W_grid = meshgrid(arange(llm_t),
+   arange(llm_h)+current_pos, arange(llm_w)+current_pos)`, raster
+   order (t outer, h middle, w inner — this matches merge-group raster
+   order, which is what the merger's output rows are already in, no
+   reordering needed). After a vision run, `current_pos +=
+   max(grid_thw[1], grid_thw[2]) // spatial_merge_size` (note: the
+   RAW pre-merge h/w, divided by merge_size = the llm-grid h/w) — NOT
+   the vision token count. Getting this +=  wrong desyncs every
+   position after the image.
+4. **Not needed for text-only generation** (the currently-tested path):
+   `has_multimodal` is false whenever no `image_grid_thw`/
+   `video_grid_thw` is passed, so `compute_3d_position_ids` returns
+   `None` and the decoder falls back to its own default sequential
+   positions — identical to what `forward.rs` already does. None of
+   this is a regression risk for existing text-only use.
+
+**Not implemented**: this is pure scoping, matching this session's
+"spec before code" discipline — no Rust code written for mRoPE or the
+splice yet. Implementing it requires two structural changes this
+runtime doesn't have yet: (a) a way to hand `forward_layer` a
+precomputed embedding row instead of doing its own `embed_row` lookup
+(needed for image-token positions), and (b) extending `pos_tensor`
+from `forward.rs`'s current scalar-per-token `f32` into a 3-wide
+(t,h,w) tensor threaded through `rope.rs`'s interleaved recomposition
+— today's `forward()` processes exactly one token with one scalar
+position per call; mRoPE needs 3. Both are scoped precisely enough to
+implement next, but deserve their own golden test (against real
+`get_rope_index`/`Qwen3_5TextRotaryEmbedding.forward` output, same
+rigor as GatedDeltaNet/VisionTower) rather than being added
+speculatively without one — and the image preprocessor gap means
+there's still no way to construct a real end-to-end test input anyway.
