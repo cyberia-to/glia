@@ -253,16 +253,19 @@ the token-embedding sequence at every position where
 `input_ids == image_token_id` (248056) — an ordered assignment, not a
 gather/scatter with any reordering logic of its own.
 
-**Not implemented**: `mrope_position_ids`/`mrope_cos_sin` exist as
-pure, golden-tested functions but are NOT wired into `forward.rs`'s
-live decode loop yet — that requires (a) a way to hand a layer a
-precomputed embedding row instead of its own `embed_row` lookup (for
-image-token positions) and (b) widening `forward()`'s current
-scalar-per-token position into a 3-wide `(t,h,w)` threaded through to
-`rope.rs`. Both are scoped exactly (`gated-delta-vl-plan.md`'s fusion
-progress entry) but not yet done — no image preprocessor exists yet
-either, so there is still no way to build a real end-to-end multimodal
-test input.
+**Wired, but not integration-tested.** `LlamaModel::forward_ex` /
+`forward_layer`'s `mrope_pos` parameter (`run/arch/decoder/forward.rs`)
+now dispatch to these functions instead of the generic `Op::Rope` path
+whenever a `TokenOverride`'s `position` is set and the layer is
+`Full`-kind with `config.mrope_section` present. The three pure
+functions underneath stay golden-tested to machine precision; the
+GLUE code calling them has never executed on any real input — only
+the 27B model has `mrope_section`, and loading it currently OOMs (the
+deferred memory ceiling), and there's still no image preprocessor to
+build a real multimodal prompt even once that's fixed. Full honest
+status in `gated-delta-vl-plan.md`'s wiring progress entry — do not
+assume this path is correct beyond "compiles, doesn't regress the
+default path, matches source on paper."
 
 ### SinusoidalEmbed
 

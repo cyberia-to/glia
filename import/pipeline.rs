@@ -228,6 +228,12 @@ pub fn import_snapshot(
                 .and_then(|v| v.as_f64())
         })
         .or_else(|| text_config["partial_rotary_factor"].as_f64());
+    // Qwen3.5/3.8 interleaved mRoPE axis split (spec: ops.md §"mRoPE,
+    // interleaved"). Absent everywhere else.
+    let mrope_section: Option<Vec<u64>> = rope_flat
+        .and_then(|p| p.get("mrope_section"))
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_u64()).collect());
     let rms_norm_eps = text_config["rms_norm_eps"].as_f64().unwrap_or(1e-6);
     let tie_word_embeddings = text_config["tie_word_embeddings"]
         .as_bool()
@@ -327,6 +333,11 @@ pub fn import_snapshot(
     }
     if let Some(prf) = partial_rotary_factor_full {
         llamaplus.push_str(&format!("partial_rotary_factor_full = {prf}\n"));
+    }
+    if let Some(ms) = &mrope_section {
+        if ms.len() == 3 {
+            llamaplus.push_str(&format!("mrope_section = [{}, {}, {}]\n", ms[0], ms[1], ms[2]));
+        }
     }
 
     // Canonical config — integers only. eps stored as 1/ε; rope_theta is

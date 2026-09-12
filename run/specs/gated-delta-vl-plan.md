@@ -541,17 +541,57 @@ reduces to a clean `j % 3 → axis` pattern (see ops.md's new "mRoPE,
 interleaved" section for the derivation) — simpler than the
 reference's own `slice(offset, length, 3)` formulation suggests.
 
-**Still NOT wired into `forward.rs`'s live decode loop** — that's the
-part still requiring the two structural changes below, deliberately
-not done speculatively without an end-to-end test to verify against
-(same standard as everything else this session):
-(a) a way to hand a layer a precomputed embedding row instead of doing
-its own `embed_row` lookup (needed for image-token positions), and
-(b) extending `pos_tensor` from `forward.rs`'s current scalar-per-token
-`f32` into a 3-wide `(t,h,w)` tensor threaded through to `rope.rs`'s
-existing partial-rotary application (the interleaved cos/sin above
-slot into the same `rope_dim < head_dim` convention `layer_rope_dim`
-already uses for Gemma-4 — no new rotation primitive needed, just a
-wider position input). The image preprocessor gap means there's still
-no way to construct a real end-to-end multimodal test input, which is
-why this wiring waits.
+**Update, same day — wired into `forward.rs`.** Both structural
+changes are done:
+- `LlamaModel::forward` is now a thin wrapper over a new
+  `forward_ex(token_id, backend, override_: Option<&TokenOverride>)`.
+  `TokenOverride { embed: Option<Vec<f32>>, position: Option<[f32;3]> }`
+  — `embed` replaces the normal `embed_row` lookup outright (an
+  image-placeholder token's embedding IS the vision tower's output
+  row, nothing to look up); `position` replaces the plain scalar
+  `past_seq_len` position for RoPE.
+- `forward_layer` gained an `mrope_pos: Option<[f32;3]>` parameter.
+  When present AND the layer's kind is `Full` (gated explicitly —
+  `LinearAttn` already returns earlier and never reaches this code;
+  a hypothetical future `Sliding`+mrope_section family would need
+  this gate to keep Sliding on plain 1D RoPE) AND
+  `config.mrope_section` is set (i.e. this model actually has
+  interleaved mRoPE, checked via `LlamaConfig.mrope_section` — new
+  field, parsed from the same flat `rope_parameters.mrope_section`
+  the rope_theta bug fix above already routes through
+  `import/pipeline.rs`), Q/K rotation goes through
+  `mrope_cos_sin`+`apply_rope_cos_sin_f32` instead of the generic
+  `Op::Rope` dispatch. The fused cross-layer GPU batch path
+  (`forward_decode_fused_layers`) doesn't know about any of this —
+  `mrope_pos.is_some()` is added to the same "force per-layer
+  fallback" condition `LinearAttn` layers already use, so multimodal
+  decoding always takes the slower per-layer CPU-reference path (same
+  precedent as GatedDeltaNet: correctness first, GPU fusion later).
+
+**Honest test status — read before trusting this path in production.**
+The three PURE functions underneath (`mrope_position_ids`,
+`mrope_cos_sin`, `apply_rope_cos_sin_f32`) are golden-tested against
+real HF output to float32 machine precision. The GLUE code above (the
+new branches in `forward_ex`/`forward_layer` that call them) is
+**NOT** covered by any test yet — verified only by (a) careful manual
+re-read of the diff, (b) the full existing test suite (89 lib tests +
+3 golden tests) staying green with zero changes, and (c) a real 8B
+generation smoke test producing byte-identical output before/after
+(proves the `override_ = None` default path is untouched — it says
+nothing about the new path's correctness). The new path itself has
+never executed once, on any input. Two things block writing that
+test: only the 27B model has `mrope_section` set, and even just
+*loading* that model currently OOMs (the deferred memory-ceiling
+issue — loading, not generating, already SIGKILLs); a synthetic
+tiny model would need real Q8-quantized `QuantWeight` bytes, which
+requires either depending on `import`'s `f32_to_q8` (crate boundary
+the runtime deliberately doesn't cross today) or writing a second
+quantizer — both deferred rather than rushed. Next session should
+either revisit once the memory ceiling is fixed (real end-to-end
+test against the real 27B model) or build the minimal synthetic-model
+test harness — do not assume this path is correct beyond what's
+written here.
+
+Still open: the image preprocessor (real image file → `pixel_values`
++ `grid_thw`) — without it there is still no way to construct a real
+multimodal prompt at all, tested or not.

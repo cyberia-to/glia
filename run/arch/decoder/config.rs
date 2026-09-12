@@ -76,6 +76,10 @@ pub struct LlamaConfig {
     /// (`partial_rotary_factor`, e.g. 0.25). Sliding layers always rotate
     /// the full head_dim. None = no partial rotary.
     pub partial_rotary_factor_full: Option<f32>,
+    /// Qwen3.5/3.8: interleaved 3D mRoPE frequency-axis split (e.g.
+    /// `[11, 11, 10]`, sums to `rope_dim/2`). `None` for every other
+    /// family — plain 1D RoPE. Spec: ops.md §"mRoPE, interleaved".
+    pub mrope_section: Option<[usize; 3]>,
     /// Gemma family: divisor for attention scaling. Default per HF Gemma 3
     /// is 256 regardless of head_dim. LlamaStyle defaults to head_dim
     /// (standard 1/sqrt(head_dim)). Affects full layers most because their
@@ -372,6 +376,12 @@ impl LlamaConfig {
             .get("partial_rotary_factor_full")
             .and_then(|v| v.as_float().or_else(|| v.as_integer().map(|i| i as f64)))
             .map(|f| f as f32);
+        let mrope_section: Option<[usize; 3]> = arch
+            .get("mrope_section")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_integer()).map(|i| i as usize).collect::<Vec<_>>())
+            .filter(|v| v.len() == 3)
+            .map(|v| [v[0], v[1], v[2]]);
         // Explicit config value wins; family profile supplies defaults for
         // families that need a non-head_dim scalar.
         let query_pre_attn_scalar = arch
@@ -425,6 +435,7 @@ impl LlamaConfig {
             num_global_key_value_heads,
             rope_theta_full,
             partial_rotary_factor_full,
+            mrope_section,
             query_pre_attn_scalar,
             family,
             linear_num_value_heads,

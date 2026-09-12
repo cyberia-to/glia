@@ -106,6 +106,22 @@ impl ForwardProf {
     }
 }
 
+/// Per-call override for multimodal (image/video) tokens — see ops.md
+/// §"mRoPE, interleaved" and gated-delta-vl-plan.md's fusion trace.
+/// Both fields are independent: a text token inside a multimodal
+/// sequence needs `position` (every token does, once any image is
+/// present) but not `embed`; an image-placeholder token needs both.
+pub struct TokenOverride {
+    /// Replaces the normal `embed_row` lookup outright — the vision
+    /// tower's own output row for this image-placeholder position.
+    pub embed: Option<Vec<f32>>,
+    /// `(t, h, w)` from `mrope_position_ids`, replacing the plain
+    /// scalar `past_seq_len` position for every `full_attention`
+    /// layer's RoPE. `linear_attention` (GatedDeltaNet) layers ignore
+    /// this entirely — they never rotate.
+    pub position: Option<[f32; 3]>,
+}
+
 impl LlamaModel {
     pub fn load(path: &Path) -> Result<Self, FormatError> {
         let lm = LoadedModel::load(path)?;
@@ -237,6 +253,19 @@ impl LlamaModel {
         token_id: u32,
         backend: &dyn Backend,
     ) -> Result<Vec<f32>, BackendError> {
+        self.forward_ex(token_id, backend, None)
+    }
+
+    /// Same as `forward`, with an optional multimodal override — see
+    /// `TokenOverride`'s doc comment. `forward` is the plain text-only
+    /// entry point (`override_ = None`); nothing about its behavior
+    /// changes here, this only adds a new path.
+    pub fn forward_ex(
+        &mut self,
+        token_id: u32,
+        backend: &dyn Backend,
+        override_: Option<&TokenOverride>,
+    ) -> Result<Vec<f32>, BackendError> {
         let c = &self.config;
 
         // Context overflow check.
@@ -287,17 +316,25 @@ impl LlamaModel {
                 eprintln!("embed row {r:>6}: abs_max={m:>8.4} rms={rms:>7.4} mean={mean:>9.5}");
             }
         }
-        let mut embed_row: Vec<f32> = self.weights.embed_row(token_id as usize, c.vocab_size)
-            .map_err(|e| BackendError::Internal(e.to_string()))?;
-        // Families that scale embeddings by sqrt(hidden_size) on lookup
-        // (Gemma 1/2/3/4). The flag is set once on the family profile.
-        if c.family.scaled_embeddings {
-            let scale = (hidden_size as f32).sqrt();
-            for v in embed_row.iter_mut() {
-                *v *= scale;
+        let mut hidden = if let Some(emb) = override_.and_then(|o| o.embed.as_ref()) {
+            // Image/video-placeholder position: the vision tower's own
+            // output row replaces the token embedding outright — no
+            // lookup, no scaled_embeddings (that's a text-embedding-
+            // table quirk, doesn't apply to vision features).
+            Tensor::try_from_f32(vec![1, hidden_size], emb.clone())?
+        } else {
+            let mut embed_row: Vec<f32> = self.weights.embed_row(token_id as usize, c.vocab_size)
+                .map_err(|e| BackendError::Internal(e.to_string()))?;
+            // Families that scale embeddings by sqrt(hidden_size) on lookup
+            // (Gemma 1/2/3/4). The flag is set once on the family profile.
+            if c.family.scaled_embeddings {
+                let scale = (hidden_size as f32).sqrt();
+                for v in embed_row.iter_mut() {
+                    *v *= scale;
+                }
             }
-        }
-        let mut hidden = Tensor::try_from_f32(vec![1, hidden_size], embed_row)?;
+            Tensor::try_from_f32(vec![1, hidden_size], embed_row)?
+        };
 
         if prof_enabled {
             self.prof.embed_ms += t_embed.elapsed().as_secs_f64() * 1000.0;
@@ -305,6 +342,12 @@ impl LlamaModel {
 
         let pos = self.past_seq_len as f32;
         let pos_tensor = Tensor::from_f32(vec![1], vec![pos]);
+        // Multimodal 3D position override — see `TokenOverride`'s doc
+        // comment. Forces the per-layer fallback path below (skips the
+        // fused cross-layer GPU dispatch entirely, same way LinearAttn
+        // layers already do): the fused path only knows the plain
+        // scalar-pos Op::Rope dispatch.
+        let mrope_pos: Option<[f32; 3]> = override_.and_then(|o| o.position);
 
         let debug_layers = std::env::var("RUN_DEBUG_LAYERS").is_ok();
         if debug_layers {
@@ -362,7 +405,7 @@ impl LlamaModel {
             .ok().and_then(|s| s.parse().ok()).unwrap_or(usize::MAX);
         let fused_debug = std::env::var("FUSED_DEBUG").is_ok();
         let used_fused;
-        if !debug_layers && !prof_enabled {
+        if !debug_layers && !prof_enabled && mrope_pos.is_none() {
             let mut li = 0;  // next layer index to process
             let mut any_fused = false;
             loop {
@@ -384,7 +427,7 @@ impl LlamaModel {
                     hidden = forward_layer(
                         &hidden, li, &self.weights.layers[li], c, &pos_tensor, backend,
                         &mut self.kv_cache[li], self.past_seq_len, None,
-                        self.gdn_state[li].as_deref_mut(),
+                        self.gdn_state[li].as_deref_mut(), None,
                     )?;
                     li += 1;
                     any_fused = true; // "handled", not literally a fused-GPU group
@@ -430,7 +473,7 @@ impl LlamaModel {
                             hidden = forward_layer(
                                 &hidden, i, &self.weights.layers[i], c, &pos_tensor, backend,
                                 &mut self.kv_cache[i], self.past_seq_len, None,
-                                self.gdn_state[i].as_deref_mut(),
+                                self.gdn_state[i].as_deref_mut(), None,
                             )?;
                         }
                         li = gi;
@@ -452,6 +495,7 @@ impl LlamaModel {
                     self.past_seq_len,
                     if prof_enabled { Some(&mut self.prof) } else { None },
                     self.gdn_state[i].as_deref_mut(),
+                    mrope_pos,
                 )?;
                 if debug_layers {
                     let h = hidden.try_as_f32()?;
@@ -573,6 +617,7 @@ fn forward_layer(
     past_seq_len: usize,
     prof: Option<&mut ForwardProf>,
     gdn_state: Option<&mut [f32]>,
+    mrope_pos: Option<[f32; 3]>,
 ) -> Result<Tensor, BackendError> {
     use std::time::Instant;
     let debug_layer = std::env::var("RUN_DEBUG_LAYER_IDX")
@@ -748,26 +793,56 @@ fn forward_layer(
     let k_shape = vec![kv_heads, head_dim];
     let q_reshaped = Tensor::from_f32(q_shape.clone(), q.to_f32_vec());
     let k_reshaped = Tensor::from_f32(k_shape.clone(), k.to_f32_vec());
-    let q_roped = backend
-        .execute(
-            &Op::Rope {
-                head_dim: head_dim as u32,
-                rope_dim: layer_rope_dim as u32,
-                base: layer_rope_base,
-            },
-            &[&q_reshaped, pos],
-        )?
-        .remove(0);
-    let k_roped = backend
-        .execute(
-            &Op::Rope {
-                head_dim: head_dim as u32,
-                rope_dim: layer_rope_dim as u32,
-                base: layer_rope_base,
-            },
-            &[&k_reshaped, pos],
-        )?
-        .remove(0);
+    // Qwen3.5/3.8 multimodal: interleaved 3D mRoPE replaces the plain
+    // scalar-pos Op::Rope dispatch for full_attention layers — CPU-only
+    // reference path (mrope.rs), same precedent as GatedDeltaNet.
+    // `layer_rope_dim`'s partial-rotary convention (contiguous prefix)
+    // and mrope_cos_sin's frequency-axis split both key off `rope_dim`;
+    // see ops.md §"mRoPE, interleaved" for why this can't reuse
+    // Op::Rope's Gemma-4-shaped math.
+    // mRoPE is a `full_attention`-only mechanism in every family that has
+    // it (Qwen3.5/3.8's `linear_attention` layers already returned above;
+    // a hypothetical future family mixing `Sliding` + mrope_section
+    // would need Sliding to keep plain 1D RoPE) — gate on layer kind
+    // explicitly rather than just "not LinearAttn".
+    let is_full_kind = config.layer_types.get(layer_idx).copied()
+        == Some(crate::arch::decoder::config::LayerKind::Full);
+    let (q_roped, k_roped) = if let (Some(triple), Some(section)) =
+        (mrope_pos.filter(|_| is_full_kind), config.mrope_section)
+    {
+        let (cos, sin) = crate::backend::cpu::mrope::mrope_cos_sin(
+            &[triple], layer_rope_dim, layer_rope_base, section,
+        );
+        let q_data = crate::backend::cpu::mrope::apply_rope_cos_sin_f32(
+            &q_reshaped.to_f32_vec(), &cos, &sin, head_dim, layer_rope_dim,
+        );
+        let k_data = crate::backend::cpu::mrope::apply_rope_cos_sin_f32(
+            &k_reshaped.to_f32_vec(), &cos, &sin, head_dim, layer_rope_dim,
+        );
+        (Tensor::from_f32(q_shape.clone(), q_data), Tensor::from_f32(k_shape.clone(), k_data))
+    } else {
+        let q_r = backend
+            .execute(
+                &Op::Rope {
+                    head_dim: head_dim as u32,
+                    rope_dim: layer_rope_dim as u32,
+                    base: layer_rope_base,
+                },
+                &[&q_reshaped, pos],
+            )?
+            .remove(0);
+        let k_r = backend
+            .execute(
+                &Op::Rope {
+                    head_dim: head_dim as u32,
+                    rope_dim: layer_rope_dim as u32,
+                    base: layer_rope_base,
+                },
+                &[&k_reshaped, pos],
+            )?
+            .remove(0);
+        (q_r, k_r)
+    };
     acc_rope += t.elapsed().as_secs_f64() * 1000.0;
 
     if debug_l0 {
