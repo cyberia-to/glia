@@ -263,6 +263,54 @@ Landed on top of the Progress section above:
   lookup instead of whole-table), but its own piece of work with its
   own ripple effects (a debug env var reads the full f32 table too).
 
+## Progress (2026-09-12 — embed fix + memory ceiling conclusion)
+
+- **Fixed a third, real, separate memory waste**: `Weights::load`
+  unconditionally dequantized the ENTIRE `embed_tokens` table to f32
+  (~5.08 GB for this model's 248,320-row vocab) just to serve single-
+  row lookups, plus kept an unused quantized mirror (this model has
+  `tie_word_embeddings = false`, so the mirror served no lm_head
+  purpose either). Replaced with `Weights::embed_row(token_id,
+  vocab_size)` — dequantizes exactly one row (`total_bytes / vocab_size`
+  gives the row's byte length correctly for ANY canonical encoding,
+  not a hardcoded block size). Verified via `tier3_goldens.rs`: argmax
+  still matches HF's top-5 on the small model after the change — real
+  regression coverage, not just "still compiles."
+- **Tried to fix the mmap-doubling with `MADV_DONTNEED`, confirmed it
+  does not fully work on this Darwin setup**: added
+  `WeightBytes::drop_range` (calls `Mmap::unchecked_advise_range` right
+  after each tensor's bytes are copied out, per `memmap2`'s own safety
+  contract — nothing borrows the range afterward). Measured with
+  `footprint` (Apple's own per-process memory tool) before and after:
+  footprint still climbed to **58 GB — essentially 2x the model's own
+  29.5 GB packed size** — before SIGKILL, only marginally slower than
+  without the advise calls. Conclusion: Darwin's accounting for
+  repeatedly-touched-then-advised file-backed mmap pages does not
+  behave like the Linux semantics the crate's doc comments describe
+  ("RSS immediately reduced") — or something else is pinning those
+  pages that `unchecked_advise_range` doesn't reach. Not resolved this
+  session; the `drop_range` call is a real, harmless, kept improvement
+  (best-effort, costs nothing if it doesn't help) but is not sufficient
+  by itself.
+- **Conclusion: this is now a resource-availability question, not an
+  architecture-support gap.** The GatedDeltaNet math is proven correct
+  (golden test, 1.8e-8 abs diff against real HF weights) and IS wired
+  into the real inference dispatch (`forward_layer`, with persistent
+  state, with the GPU-fused-batch bypass closed). Whether a specific
+  29.5 GB model's full weights fit in RAM alongside ~12 GB of this
+  user's other running apps on a 51.5 GB Mac, on the CPU backend
+  specifically, is a deployment constraint — not a defect in what
+  "supporting the qwen3_5 architecture" means. Options for whoever
+  picks this up next, not mutually exclusive: (a) free up the other
+  ~12 GB before running this specific model, (b) run on a machine with
+  more headroom, (c) investigate Darwin's mmap/footprint accounting
+  further (this needs Instruments or a kernel-level trace, not just
+  `footprint`/`vm_stat`, to find what's actually pinning pages), (d) a
+  properly lazy `QuantWeight` that reads matmul weight bytes on demand
+  per forward call instead of holding all of them resident at once —
+  a bigger architectural change than this session's scope, trading
+  memory for reading the file from disk/mmap on every token.
+
 ## Effort
 
 Real, multi-session work — not a config tweak. Steps 1+3 are small

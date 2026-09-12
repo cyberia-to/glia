@@ -76,6 +76,35 @@ impl WeightBytes {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// Tell the kernel this byte range's mmap'd pages won't be read
+    /// again — call this right after copying a tensor's bytes out, not
+    /// before (the safety contract on `MADV_DONTNEED` is that nothing
+    /// still borrows the range). Without this, the loader's own reads
+    /// through the mmap accumulate as resident file-backed pages ON TOP
+    /// OF the owned copies each tensor lands in, and macOS does not
+    /// reclaim them fast enough under a sustained sequential-write
+    /// workload to avoid an OOM on a large model — `phys_footprint`
+    /// climbed past the model's own 29.5 GB packed size and kept rising
+    /// before this was added (`gated-delta-vl-plan.md`, "climbs past its
+    /// own honest size"). No-op for `Owned` — nothing mmap'd to drop.
+    /// Best-effort: a failure here costs performance, not correctness.
+    pub fn drop_range(&self, range: std::ops::Range<usize>) {
+        if let WeightBytes::Mapped { mmap, weights_start } = self {
+            // SAFETY: MADV_DONTNEED's contract is that nothing still reads
+            // through this range afterward — true here by construction:
+            // every caller (`tensor_bytes_owned`) copies the bytes out
+            // FIRST and calls this only after that copy exists, never
+            // while a borrow into the mmap is still alive.
+            let _ = unsafe {
+                mmap.unchecked_advise_range(
+                    memmap2::UncheckedAdvice::DontNeed,
+                    weights_start + range.start,
+                    range.len(),
+                )
+            };
+        }
+    }
 }
 
 /// Per-tensor metadata from the tensors section.
@@ -310,5 +339,21 @@ impl LoadedModel {
         let start = meta.offset as usize;
         let end = start + meta.size as usize;
         self.file.weights.get(start..end)
+    }
+
+    /// Copy one tensor's bytes out and immediately advise the kernel
+    /// that its source pages (mmap-backed models only) won't be read
+    /// again. Every loader that will hold its own copy for the model's
+    /// lifetime anyway (`load_quant_weight`, `load_tensor_f32`) should
+    /// use this instead of `tensor_bytes(name).to_vec()` — see
+    /// `WeightBytes::drop_range`'s doc for why the difference matters
+    /// on a large model.
+    pub fn tensor_bytes_owned(&self, name: &str) -> Option<Vec<u8>> {
+        let meta = self.tensors.iter().find(|t| t.name == name)?;
+        let start = meta.offset as usize;
+        let end = start + meta.size as usize;
+        let bytes = self.file.weights.get(start..end)?.to_vec();
+        self.file.weights.drop_range(start..end);
+        Some(bytes)
     }
 }

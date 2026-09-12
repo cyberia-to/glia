@@ -84,14 +84,17 @@ pub struct GatedDeltaLayerWeights {
 }
 
 pub struct Weights {
-    /// Embed is dequantized to f32 for single-row lookup during forward.
-    pub embed_tokens: Tensor,
     pub layers: Vec<LayerWeights>,
     pub final_norm: Tensor,
     /// LM head stays quantized. None = tied to embed_tokens (dequanted).
     pub lm_head: Option<QuantWeight>,
-    /// Mirror of embed_tokens as quantized bytes, used for tied-weight matmul.
-    /// Avoids re-dequanting on every lm_head call.
+    /// Stays quantized on host — used both for the tied-weight lm_head
+    /// matmul AND for the per-token embed lookup, which dequantizes ONLY
+    /// the one row it needs (`Weights::embed_row`) rather than ever
+    /// materializing the whole table. A large-vocab model's embed table
+    /// dequantized whole was ~5 GB of dead weight held for single-row
+    /// reads and contributed to `run/specs/gated-delta-vl-plan.md`'s
+    /// "still doesn't run end-to-end" finding.
     pub embed_tokens_quant: QuantWeight,
 }
 
@@ -113,11 +116,7 @@ impl Weights {
         // [hidden, vocab] (GGUF-native metadata). Physical byte layout is
         // always [vocab × hidden] values row-major, so we just force the
         // shape to [vocab, hidden] regardless of what the metadata says.
-        let embed_tokens = load_tensor_f32_reshaped(
-            lm,
-            "model.embed_tokens.weight",
-            vec![vocab_size, hidden_size],
-        )?;
+        // Stays quantized — see the field doc on `embed_tokens_quant`.
         let embed_tokens_quant = load_quant_weight_reshaped(
             lm,
             "model.embed_tokens.weight",
@@ -174,12 +173,42 @@ impl Weights {
         }
 
         Ok(Self {
-            embed_tokens,
             embed_tokens_quant,
             layers,
             final_norm,
             lm_head,
         })
+    }
+
+    /// Dequantize exactly one row of the embed table — the `hidden_size`
+    /// values for `token_id`, nothing else. Works for any canonical
+    /// encoding: row byte length is `total_bytes / vocab_size`, not a
+    /// hardcoded block size, so it stays correct whichever encoding
+    /// `canonical_encoding_for` chose for this tensor at import time.
+    /// Requires `hidden_size` elements to end on a byte boundary for the
+    /// encoding in use (true for every block size in this codebase — 32,
+    /// 256 — as long as `hidden_size` is itself a multiple of the block
+    /// size, which every model here satisfies; a model that didn't would
+    /// already have failed import's own block-alignment check).
+    pub fn embed_row(&self, token_id: usize, vocab_size: usize) -> Result<Vec<f32>, FormatError> {
+        let qw = &self.embed_tokens_quant;
+        if qw.bytes.is_empty() {
+            return Err(FormatError::Invalid(
+                "embed_tokens_quant bytes are gone (host bytes were freed after a GPU upload) \
+                 — embed lookup needs them; this backend's uploads_quant_weights() path doesn't \
+                 support host-side row lookup yet".into(),
+            ));
+        }
+        let row_bytes = qw.bytes.len() / vocab_size;
+        let start = token_id * row_bytes;
+        let end = start + row_bytes;
+        let bytes = qw.bytes.get(start..end).ok_or_else(|| {
+            FormatError::Invalid(format!(
+                "token_id {token_id} out of range for embed table ({vocab_size} rows)"
+            ))
+        })?;
+        try_dequantize_to_f32(bytes, qw.dtype)
+            .map_err(|e| FormatError::Invalid(format!("dequant embed row {token_id}: {e}")))
     }
 }
 
@@ -201,9 +230,9 @@ fn load_tensor_f32(lm: &LoadedModel, name: &str) -> Result<Tensor, FormatError> 
         .find(|t| t.name == name)
         .ok_or_else(|| FormatError::Invalid(format!("missing tensor {name}")))?;
     let bytes = lm
-        .tensor_bytes(name)
+        .tensor_bytes_owned(name)
         .ok_or_else(|| FormatError::Invalid(format!("bytes missing for {name}")))?;
-    let f32s = try_dequantize_to_f32(bytes, meta.dtype)
+    let f32s = try_dequantize_to_f32(&bytes, meta.dtype)
         .map_err(|e| FormatError::Invalid(format!("dequant {name}: {e}")))?;
     Tensor::try_from_f32(meta.shape.clone(), f32s)
         .map_err(|e| FormatError::Invalid(format!("tensor {name}: {e}")))
@@ -216,9 +245,9 @@ fn load_quant_weight(lm: &LoadedModel, name: &str) -> Result<QuantWeight, Format
         .find(|t| t.name == name)
         .ok_or_else(|| FormatError::Invalid(format!("missing tensor {name}")))?;
     let bytes = lm
-        .tensor_bytes(name)
+        .tensor_bytes_owned(name)
         .ok_or_else(|| FormatError::Invalid(format!("bytes missing for {name}")))?;
-    let raw: Arc<Vec<u8>> = Arc::new(bytes.to_vec());
+    let raw: Arc<Vec<u8>> = Arc::new(bytes);
     let tensor = Tensor {
         shape: meta.shape.clone(),
         dtype: meta.dtype,

@@ -263,12 +263,13 @@ impl LlamaModel {
         let prof_enabled = self.prof.enabled;
         let t_embed = Instant::now();
 
-        // Embed lookup: one row of embed_tokens.
-        let embed_table = &self.weights.embed_tokens;
+        // Embed lookup: dequantize ONLY this one row, never the whole
+        // table (`Weights::embed_row` — see its doc comment for why: a
+        // large-vocab model's table dequantized whole was ~5 GB held for
+        // single-row reads).
         let hidden_size = c.hidden_size;
         // One-shot diagnostic: dump stats for specific rows on first call.
         if std::env::var("RUN_DEBUG_EMBED_ROWS").is_ok() && self.past_seq_len == 0 {
-            let table = embed_table.try_as_f32()?;
             let rows_to_check: Vec<usize> = std::env::var("RUN_DEBUG_EMBED_ROWS")
                 .ok()
                 .map(|s| {
@@ -278,16 +279,16 @@ impl LlamaModel {
                 })
                 .unwrap_or_default();
             for r in &rows_to_check {
-                let s = r * hidden_size;
-                let row = &table[s..s + hidden_size];
+                let row = self.weights.embed_row(*r, c.vocab_size)
+                    .map_err(|e| BackendError::Internal(e.to_string()))?;
                 let m = row.iter().map(|v| v.abs()).fold(0f32, f32::max);
                 let rms = (row.iter().map(|v| v * v).sum::<f32>() / hidden_size as f32).sqrt();
                 let mean = row.iter().sum::<f32>() / hidden_size as f32;
                 eprintln!("embed row {r:>6}: abs_max={m:>8.4} rms={rms:>7.4} mean={mean:>9.5}");
             }
         }
-        let row_start = (token_id as usize) * hidden_size;
-        let mut embed_row: Vec<f32> = embed_table.try_as_f32()?[row_start..row_start + hidden_size].to_vec();
+        let mut embed_row: Vec<f32> = self.weights.embed_row(token_id as usize, c.vocab_size)
+            .map_err(|e| BackendError::Internal(e.to_string()))?;
         // Families that scale embeddings by sqrt(hidden_size) on lookup
         // (Gemma 1/2/3/4). The flag is set once on the family profile.
         if c.family.scaled_embeddings {
