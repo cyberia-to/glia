@@ -232,6 +232,10 @@ pub struct HoneycrispBackend {
     /// Key = original Metal buffer address (stable, page-aligned).
     /// Value = transposed Q8 buffer [n_blocks, n_rows, 34] on GPU.
     transposed_down_w: std::sync::Mutex<TransposedCache>,
+    /// Lazily-built mRoPE pipelines, keyed by (head_dim, rope_dim) — bakes
+    /// both as MSL constants (same Metal-scheduler-regression avoidance as
+    /// every other kernel here). Qwen3.5/3.8 only, one geometry per model.
+    mrope_pipes: std::sync::Mutex<Vec<(usize, usize, HcPipeline)>>,
 }
 
 struct TransposedCache(std::collections::HashMap<usize, Box<aruminium::Buffer>>);
@@ -406,7 +410,20 @@ impl HoneycrispBackend {
             scratch: BufferPool::new(),
             attn: std::sync::Mutex::new(Vec::new()),
             transposed_down_w: std::sync::Mutex::new(TransposedCache(std::collections::HashMap::new())),
+            mrope_pipes: std::sync::Mutex::new(Vec::new()),
         })
+    }
+
+    /// Lazily compile (and cache) the mRoPE pipeline for `(head_dim, rope_dim)`.
+    fn mrope_pipeline(&self, head_dim: usize, rope_dim: usize) -> Result<(), BackendError> {
+        let mut guard = self.mrope_pipes.lock().unwrap();
+        if guard.iter().any(|(hd, rd, _)| *hd == head_dim && *rd == rope_dim) {
+            return Ok(());
+        }
+        let msl = kernels::mrope::msl_for(head_dim, rope_dim);
+        let pipe = HcPipeline(self.device.pipeline(&msl)?);
+        guard.push((head_dim, rope_dim, pipe));
+        Ok(())
     }
 
     /// Lazily build attention state. Geometry change → full reset (drops cache).
@@ -974,6 +991,33 @@ impl Backend for HoneycrispBackend {
         let result = self.wrap_output(out_buf, vec![1, (num_heads * head_dim) as usize], DType::F32);
 
         Ok(result)
+    }
+
+    fn apply_mrope_cos_sin(
+        &self,
+        x: &Tensor,
+        cos: &[f32],
+        sin: &[f32],
+        head_dim: usize,
+        rope_dim: usize,
+    ) -> Result<Tensor, BackendError> {
+        self.mrope_pipeline(head_dim, rope_dim)?;
+        let guard = self.mrope_pipes.lock().unwrap();
+        let (_, _, pipe) = guard
+            .iter()
+            .find(|(hd, rd, _)| *hd == head_dim && *rd == rope_dim)
+            .expect("mrope_pipeline just inserted this geometry");
+        let n_rows = (x.numel() / head_dim) as u32;
+        let x_buf = self.buf_ref(x)?;
+        let cos_buf = self.device.gpu.buffer_with_data(bytemuck::cast_slice(cos))
+            .map_err(|e| BackendError::Internal(format!("mrope cos upload: {e}")))?;
+        let sin_buf = self.device.gpu.buffer_with_data(bytemuck::cast_slice(sin))
+            .map_err(|e| BackendError::Internal(format!("mrope sin upload: {e}")))?;
+        let out_buf = kernels::mrope::dispatch(
+            &self.device, &pipe.0, x_buf.as_buffer(), &cos_buf, &sin_buf,
+            n_rows, head_dim as u32,
+        )?;
+        Ok(self.wrap_output(out_buf, x.shape.clone(), DType::F32))
     }
 
     fn supports(&self, op: &Op, inputs: &[&Tensor]) -> bool {

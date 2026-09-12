@@ -827,13 +827,12 @@ fn forward_layer(
         let (cos, sin) = crate::backend::cpu::mrope::mrope_cos_sin(
             &[triple], layer_rope_dim, layer_rope_base, section,
         );
-        let q_data = crate::backend::cpu::mrope::apply_rope_cos_sin_f32(
-            &q_reshaped.to_f32_vec(), &cos, &sin, head_dim, layer_rope_dim,
-        );
-        let k_data = crate::backend::cpu::mrope::apply_rope_cos_sin_f32(
-            &k_reshaped.to_f32_vec(), &cos, &sin, head_dim, layer_rope_dim,
-        );
-        (Tensor::from_f32(q_shape.clone(), q_data), Tensor::from_f32(k_shape.clone(), k_data))
+        // Backend-dispatched — CPU backend runs `apply_rope_cos_sin_f32`
+        // directly (trait default), honeycrisp runs its own Metal kernel
+        // (kernels::mrope) with the SAME contiguous-prefix math.
+        let q_r = backend.apply_mrope_cos_sin(&q_reshaped, &cos, &sin, head_dim, layer_rope_dim)?;
+        let k_r = backend.apply_mrope_cos_sin(&k_reshaped, &cos, &sin, head_dim, layer_rope_dim)?;
+        (q_r, k_r)
     } else {
         let q_r = backend
             .execute(

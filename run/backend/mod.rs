@@ -363,6 +363,33 @@ pub trait Backend: Send + Sync {
     /// Fused SiLU(gate) * up. Default: split into two ops on CPU.
     /// GPU backends override with a single kernel — half the memory bandwidth
     /// and a single dispatch instead of two.
+    /// Qwen3.5/3.8 interleaved-mRoPE Q/K rotation — contiguous `rope_dim`
+    /// prefix rotated (own `rotate_half`, split at `rope_dim/2`), the
+    /// `head_dim - rope_dim` tail passed through unchanged. NOT the same
+    /// index convention as `Op::Rope` (built for Gemma-4's interleaved-
+    /// pairs-across-full-head_dim scheme) — see
+    /// `backend::cpu::mrope::apply_rope_cos_sin_f32`'s doc comment and
+    /// ops.md §"mRoPE, interleaved". `x`: `[n_rows, head_dim]`. `cos`/
+    /// `sin`: `[rope_dim]`, one token's precomputed frequencies
+    /// (duplicated across the two halves — `mrope_cos_sin`'s output).
+    /// Default: CPU reference. GPU backends override with a kernel.
+    fn apply_mrope_cos_sin(
+        &self,
+        x: &Tensor,
+        cos: &[f32],
+        sin: &[f32],
+        head_dim: usize,
+        rope_dim: usize,
+    ) -> Result<Tensor, BackendError> {
+        let x_data = if let Some(b) = x.as_host_bytes() {
+            bytemuck::cast_slice::<u8, f32>(b).to_vec()
+        } else {
+            self.download_f32(x)?
+        };
+        let out = crate::backend::cpu::mrope::apply_rope_cos_sin_f32(&x_data, cos, sin, head_dim, rope_dim);
+        Ok(Tensor::from_f32(x.shape.clone(), out))
+    }
+
     fn silu_mul(&self, gate: &Tensor, up: &Tensor) -> Result<Tensor, BackendError> {
         // Default falls back to host f32 path.
         let g = if let Some(b) = gate.as_host_bytes() {
