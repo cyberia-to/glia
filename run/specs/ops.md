@@ -155,7 +155,99 @@ for axis, (pos_axis, dim_axis) in enumerate(zip(pos_vec, dims_per_axis)):
 ```
 
 Each axis gets an independent RoPE over its own sub-range. `base`
-may differ per axis (configured per-model).
+may differ per axis (configured per-model). This is the
+BLOCK-CONCATENATED scheme (Qwen2-VL/Qwen2.5-VL style: axis `t/h/w`
+each own a contiguous sub-range of the rotated dims) — Qwen3.5/3.8
+uses a DIFFERENT, INTERLEAVED scheme instead, below.
+
+### mRoPE, interleaved (Qwen3.5/3.8 text decoder, multimodal input)
+
+Verified against `transformers.models.qwen3_5.modeling_qwen3_5`
+(`Qwen3_5Model.get_rope_index`/`get_vision_position_ids`,
+`Qwen3_5TextRotaryEmbedding`) — 2026-09, transformers 5.17.0. Rust:
+`run/backend/cpu/mrope.rs`, golden-tested in `run/tests/mrope_golden.rs`
+to float32 machine precision (5.96e-8) against real HF output. Only
+the 16 real `full_attention` (Sdpa) layers ever call this —
+`linear_attention` (GatedDeltaNet) layers never rotate at all (ops.md
+§"GatedDeltaNet"), and it is mandatory (not optional) whenever
+`image_grid_thw`/`video_grid_thw` is present — HF raises rather than
+falling back to 1D positions in that case.
+
+Config (`Qwen3_5TextConfig.rope_parameters`, flat dict — see
+`format.md`'s "Two different source JSON shapes" note for the import
+subtlety this caused): `rope_theta` (10_000_000 for the 27B model),
+`partial_rotary_factor` (0.25 → `rope_dim = head_dim * 0.25` = 64 of
+256), `mrope_section` (`[11, 11, 10]`, sums to `rope_dim/2` = 32),
+`mrope_interleaved` (`true` — this spec only covers the interleaved
+case, HF's older block-concatenated mRoPE from Qwen2-VL is a
+different, unimplemented code path this model doesn't use).
+
+**1. Position-id triples per token** (`mrope_position_ids` /
+`get_rope_index`): walk the token sequence as runs of one modality
+each (text / image / video, from `mm_token_type_ids`).
+```
+current_pos = 0
+for run in modality_runs:
+  if run is Text(len):
+    for i in 0..len: emit (current_pos+i, current_pos+i, current_pos+i)  # t=h=w
+    current_pos += len
+  if run is Vision(t, h, w):        # RAW pre-merge grid_thw for this image/frame
+    llm_t, llm_h, llm_w = t, h/merge, w/merge     # merge = spatial_merge_size
+    for ti in 0..llm_t:              # meshgrid, indexing="ij": T outer, H mid, W inner
+      for hi in 0..llm_h:
+        for wi in 0..llm_w:
+          emit (ti+current_pos, hi+current_pos, wi+current_pos)
+    current_pos += max(h, w) / merge        # NOT the vision token count
+```
+Plain text (no image ever in the sequence) collapses to `t=h=w` for
+every token — numerically identical to this codebase's existing 1D
+position scheme; the two only diverge once a vision run is present.
+
+**2. Interleaved frequency ownership** (`mrope_cos_sin` /
+`Qwen3_5TextRotaryEmbedding.forward` + `recomposition_frequencies`):
+build the SAME `inv_freq[j] = 1/rope_theta^(2j/rope_dim)` table
+(`j` in `0..rope_dim/2`) used by plain RoPE, but instead of one
+running position multiplying every `j`, EACH `j` picks its axis
+(t/h/w) by `j % 3` (0→t, 1→h, 2→w) — the reference's
+`slice(offset, mrope_section[axis]*3, 3)` formula reduces to exactly
+this pattern (verified against `mrope_section=[11,11,10]`: axis 0
+owns indices `{0,3,...,30}` = 11, axis 1 owns `{1,4,...,31}` = 11,
+axis 2 owns `{2,5,...,29}` = 10 — sums to `mrope_section` exactly).
+```
+MropeCosSin(positions[seq_len][3], rope_dim, rope_theta):
+  n_freq = rope_dim / 2
+  inv_freq[j] = 1 / rope_theta^(2j / rope_dim)     for j in 0..n_freq
+  for t in 0..seq_len:
+    for j in 0..n_freq:
+      axis = j % 3                                  # 0=T, 1=H, 2=W
+      angle = positions[t][axis] * inv_freq[j]
+      cos[t][j] = cos[t][j+n_freq] = cos(angle)
+      sin[t][j] = sin[t][j+n_freq] = sin(angle)
+```
+Applied to Q/K via the SAME `rotate_half` + `q*cos + rotate_half(q)*sin`
+as plain RoPE — only cos/sin construction differs. `rope_dim < head_dim`
+(partial rotary, 64 of 256): the trailing `head_dim - rope_dim` dims
+pass through unrotated, same convention as `layer_rope_dim`'s existing
+Gemma-4 partial-rotary case (ops.md's plain Rope section above).
+
+**Text-stream fusion** (image-embedding splice, `masked_scatter`):
+`image_embeds = visual(pixel_values, grid_thw).pooler_output` (the
+vision tower's own output, already implemented — see "VisionTower"
+above), split per-image by token count, then copied 1:1 in order into
+the token-embedding sequence at every position where
+`input_ids == image_token_id` (248056) — an ordered assignment, not a
+gather/scatter with any reordering logic of its own.
+
+**Not implemented**: `mrope_position_ids`/`mrope_cos_sin` exist as
+pure, golden-tested functions but are NOT wired into `forward.rs`'s
+live decode loop yet — that requires (a) a way to hand a layer a
+precomputed embedding row instead of its own `embed_row` lookup (for
+image-token positions) and (b) widening `forward()`'s current
+scalar-per-token position into a 3-wide `(t,h,w)` threaded through to
+`rope.rs`. Both are scoped exactly (`gated-delta-vl-plan.md`'s fusion
+progress entry) but not yet done — no image preprocessor exists yet
+either, so there is still no way to build a real end-to-end multimodal
+test input.
 
 ### SinusoidalEmbed
 

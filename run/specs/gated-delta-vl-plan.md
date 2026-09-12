@@ -528,18 +528,30 @@ flagged as "not yet traced." Full mechanics, verified against source
    positions — identical to what `forward.rs` already does. None of
    this is a regression risk for existing text-only use.
 
-**Not implemented**: this is pure scoping, matching this session's
-"spec before code" discipline — no Rust code written for mRoPE or the
-splice yet. Implementing it requires two structural changes this
-runtime doesn't have yet: (a) a way to hand `forward_layer` a
-precomputed embedding row instead of doing its own `embed_row` lookup
-(needed for image-token positions), and (b) extending `pos_tensor`
-from `forward.rs`'s current scalar-per-token `f32` into a 3-wide
-(t,h,w) tensor threaded through `rope.rs`'s interleaved recomposition
-— today's `forward()` processes exactly one token with one scalar
-position per call; mRoPE needs 3. Both are scoped precisely enough to
-implement next, but deserve their own golden test (against real
-`get_rope_index`/`Qwen3_5TextRotaryEmbedding.forward` output, same
-rigor as GatedDeltaNet/VisionTower) rather than being added
-speculatively without one — and the image preprocessor gap means
-there's still no way to construct a real end-to-end test input anyway.
+**Update, same day**: the pure-arithmetic half of this IS now
+implemented and golden-tested — `run/backend/cpu/mrope.rs`
+(`mrope_position_ids` = `get_rope_index`, `mrope_cos_sin` =
+`Qwen3_5TextRotaryEmbedding.forward` + `recomposition_frequencies`),
+`run/tests/mrope_golden.rs` against real HF output
+(`run/scripts/dump_mrope_golden.py` — a tiny real `Qwen3_5Model`
+instance, real config values, no big weights needed since this is
+pure index/config math) to float32 machine precision (5.96e-8, cos
+and sin both). Confirmed the "interleaved" frequency-ownership rule
+reduces to a clean `j % 3 → axis` pattern (see ops.md's new "mRoPE,
+interleaved" section for the derivation) — simpler than the
+reference's own `slice(offset, length, 3)` formulation suggests.
+
+**Still NOT wired into `forward.rs`'s live decode loop** — that's the
+part still requiring the two structural changes below, deliberately
+not done speculatively without an end-to-end test to verify against
+(same standard as everything else this session):
+(a) a way to hand a layer a precomputed embedding row instead of doing
+its own `embed_row` lookup (needed for image-token positions), and
+(b) extending `pos_tensor` from `forward.rs`'s current scalar-per-token
+`f32` into a 3-wide `(t,h,w)` tensor threaded through to `rope.rs`'s
+existing partial-rotary application (the interleaved cos/sin above
+slot into the same `rope_dim < head_dim` convention `layer_rope_dim`
+already uses for Gemma-4 — no new rotation primitive needed, just a
+wider position input). The image preprocessor gap means there's still
+no way to construct a real end-to-end multimodal test input, which is
+why this wiring waits.

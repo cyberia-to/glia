@@ -18,6 +18,7 @@ mod rope;
 mod softmax;
 mod activation;
 pub mod gated_delta;
+pub mod mrope;
 pub mod quant;
 pub mod quant_matmul;
 pub mod vision;

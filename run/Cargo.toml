@@ -74,6 +74,10 @@ name = "vision_golden"
 path = "tests/vision_golden.rs"
 
 [[test]]
+name = "mrope_golden"
+path = "tests/mrope_golden.rs"
+
+[[test]]
 name = "tier4_ir_exec"
 path = "tests/tier4_ir_exec.rs"
 
