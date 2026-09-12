@@ -236,6 +236,9 @@ pub struct HoneycrispBackend {
     /// both as MSL constants (same Metal-scheduler-regression avoidance as
     /// every other kernel here). Qwen3.5/3.8 only, one geometry per model.
     mrope_pipes: std::sync::Mutex<Vec<(usize, usize, HcPipeline)>>,
+    /// Lazily-built GatedDeltaNet recurrence-step pipelines, keyed by
+    /// (head_k_dim, head_v_dim).
+    gdn_pipes: std::sync::Mutex<Vec<(usize, usize, HcPipeline)>>,
 }
 
 struct TransposedCache(std::collections::HashMap<usize, Box<aruminium::Buffer>>);
@@ -411,6 +414,7 @@ impl HoneycrispBackend {
             attn: std::sync::Mutex::new(Vec::new()),
             transposed_down_w: std::sync::Mutex::new(TransposedCache(std::collections::HashMap::new())),
             mrope_pipes: std::sync::Mutex::new(Vec::new()),
+            gdn_pipes: std::sync::Mutex::new(Vec::new()),
         })
     }
 
@@ -423,6 +427,19 @@ impl HoneycrispBackend {
         let msl = kernels::mrope::msl_for(head_dim, rope_dim);
         let pipe = HcPipeline(self.device.pipeline(&msl)?);
         guard.push((head_dim, rope_dim, pipe));
+        Ok(())
+    }
+
+    /// Lazily compile (and cache) the GatedDeltaNet recurrence-step
+    /// pipeline for `(head_k_dim, head_v_dim)`.
+    fn gdn_pipeline(&self, head_k_dim: usize, head_v_dim: usize) -> Result<(), BackendError> {
+        let mut guard = self.gdn_pipes.lock().unwrap();
+        if guard.iter().any(|(hk, hv, _)| *hk == head_k_dim && *hv == head_v_dim) {
+            return Ok(());
+        }
+        let msl = kernels::gated_delta::msl_for(head_k_dim, head_v_dim);
+        let pipe = HcPipeline(self.device.pipeline(&msl)?);
+        guard.push((head_k_dim, head_v_dim, pipe));
         Ok(())
     }
 
@@ -1018,6 +1035,53 @@ impl Backend for HoneycrispBackend {
             n_rows, head_dim as u32,
         )?;
         Ok(self.wrap_output(out_buf, x.shape.clone(), DType::F32))
+    }
+
+    fn gated_delta_recurrence_step(
+        &self,
+        state: &mut [f32],
+        q_t: &[f32],
+        k_t: &[f32],
+        v_t: &[f32],
+        decay: &[f32],
+        beta: &[f32],
+        num_heads: usize,
+        head_k_dim: usize,
+        head_v_dim: usize,
+    ) -> Result<Vec<f32>, BackendError> {
+        self.gdn_pipeline(head_k_dim, head_v_dim)?;
+        let guard = self.gdn_pipes.lock().unwrap();
+        let (_, _, pipe) = guard
+            .iter()
+            .find(|(hk, hv, _)| *hk == head_k_dim && *hv == head_v_dim)
+            .expect("gdn_pipeline just inserted this geometry");
+
+        let state_buf = self.device.gpu.buffer_with_data(bytemuck::cast_slice(state))
+            .map_err(|e| BackendError::Internal(format!("gdn state upload: {e}")))?;
+        let q_buf = self.device.gpu.buffer_with_data(bytemuck::cast_slice(q_t))
+            .map_err(|e| BackendError::Internal(format!("gdn q upload: {e}")))?;
+        let k_buf = self.device.gpu.buffer_with_data(bytemuck::cast_slice(k_t))
+            .map_err(|e| BackendError::Internal(format!("gdn k upload: {e}")))?;
+        let v_buf = self.device.gpu.buffer_with_data(bytemuck::cast_slice(v_t))
+            .map_err(|e| BackendError::Internal(format!("gdn v upload: {e}")))?;
+        let decay_buf = self.device.gpu.buffer_with_data(bytemuck::cast_slice(decay))
+            .map_err(|e| BackendError::Internal(format!("gdn decay upload: {e}")))?;
+        let beta_buf = self.device.gpu.buffer_with_data(bytemuck::cast_slice(beta))
+            .map_err(|e| BackendError::Internal(format!("gdn beta upload: {e}")))?;
+
+        let out_buf = kernels::gated_delta::dispatch(
+            &self.device, &pipe.0,
+            &state_buf, &q_buf, &k_buf, &v_buf, &decay_buf, &beta_buf,
+            num_heads as u32, head_v_dim as u32,
+        )?;
+
+        // state was mutated in place on the GPU side — read it back into
+        // the caller's buffer (this method's contract: read-modify-write).
+        let state_len = state.len();
+        state_buf.read_f32(|s| state.copy_from_slice(&s[..state_len]));
+        let out_len = num_heads * head_v_dim;
+        let out = out_buf.read_f32(|o| o[..out_len].to_vec());
+        Ok(out)
     }
 
     fn supports(&self, op: &Op, inputs: &[&Tensor]) -> bool {

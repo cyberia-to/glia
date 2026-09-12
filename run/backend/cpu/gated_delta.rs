@@ -189,40 +189,8 @@ pub fn gated_delta_forward(
             let v_t = &value[ti * vd + hi * hv..ti * vd + (hi + 1) * hv];
             let decay_t = g[ti * h + hi].exp();
             let beta_t = beta[ti * h + hi];
-
-            for s in st.iter_mut() {
-                *s *= decay_t;
-            }
-            // kv_mem[j] = sum_i state[i,j] * k_t[i]  (k_t @ state)
-            let mut kv_mem = vec![0f32; hv];
-            for i in 0..hk {
-                let row = &st[i * hv..(i + 1) * hv];
-                let ki = k_t[i];
-                for j in 0..hv {
-                    kv_mem[j] += row[j] * ki;
-                }
-            }
-            // delta = (v_t - kv_mem) * beta_t; state += outer(k_t, delta)
-            let mut delta = vec![0f32; hv];
-            for j in 0..hv {
-                delta[j] = (v_t[j] - kv_mem[j]) * beta_t;
-            }
-            for i in 0..hk {
-                let ki = k_t[i];
-                let row = &mut st[i * hv..(i + 1) * hv];
-                for j in 0..hv {
-                    row[j] += ki * delta[j];
-                }
-            }
-            // out[j] = sum_i state[i,j] * q_t[i]  (q_t @ state, post-update)
             let out_row = &mut out[(ti * h + hi) * hv..(ti * h + hi + 1) * hv];
-            for i in 0..hk {
-                let row = &st[i * hv..(i + 1) * hv];
-                let qi = q_t[i];
-                for j in 0..hv {
-                    out_row[j] += row[j] * qi;
-                }
-            }
+            recurrence_step(st, q_t, k_t, v_t, decay_t, beta_t, hk, hv, out_row);
         }
     }
 
@@ -250,6 +218,64 @@ pub fn gated_delta_forward(
     let result = matmul_f32(&gated_t, w.out_proj)?;
     debug_assert_eq!(result.shape, vec![t, hidden]);
     Ok(result)
+}
+
+/// One head's delta-rule step: decay `st` in place, read `kv_mem = st^T
+/// @ k_t` (using the DECAYED state — decay happens before this read,
+/// not after), rank-1-update `st += outer(k_t, (v_t - kv_mem) * beta_t)`,
+/// then write `out = st^T @ q_t` (using the just-updated state). `st`:
+/// `[hk, hv]` row-major, mutated in place. `out`: `[hv]`, overwritten.
+///
+/// Extracted as its own function so the honeycrisp GPU kernel test can
+/// compare a single head's GPU output against this SAME reference call
+/// on identical synthetic input, independent of the surrounding
+/// projections/conv/gates — see `run/tests/gated_delta_honeycrisp.rs`.
+pub fn recurrence_step(
+    st: &mut [f32],
+    q_t: &[f32],
+    k_t: &[f32],
+    v_t: &[f32],
+    decay_t: f32,
+    beta_t: f32,
+    hk: usize,
+    hv: usize,
+    out: &mut [f32],
+) {
+    for s in st.iter_mut() {
+        *s *= decay_t;
+    }
+    // kv_mem[j] = sum_i state[i,j] * k_t[i]  (k_t @ state)
+    let mut kv_mem = vec![0f32; hv];
+    for i in 0..hk {
+        let row = &st[i * hv..(i + 1) * hv];
+        let ki = k_t[i];
+        for j in 0..hv {
+            kv_mem[j] += row[j] * ki;
+        }
+    }
+    // delta = (v_t - kv_mem) * beta_t; state += outer(k_t, delta)
+    let mut delta = vec![0f32; hv];
+    for j in 0..hv {
+        delta[j] = (v_t[j] - kv_mem[j]) * beta_t;
+    }
+    for i in 0..hk {
+        let ki = k_t[i];
+        let row = &mut st[i * hv..(i + 1) * hv];
+        for j in 0..hv {
+            row[j] += ki * delta[j];
+        }
+    }
+    // out[j] = sum_i state[i,j] * q_t[i]  (q_t @ state, post-update)
+    for o in out.iter_mut() {
+        *o = 0.0;
+    }
+    for i in 0..hk {
+        let row = &st[i * hv..(i + 1) * hv];
+        let qi = q_t[i];
+        for j in 0..hv {
+            out[j] += row[j] * qi;
+        }
+    }
 }
 
 fn sigmoid(x: f32) -> f32 {

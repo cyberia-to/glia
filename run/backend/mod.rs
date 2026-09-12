@@ -390,6 +390,50 @@ pub trait Backend: Send + Sync {
         Ok(Tensor::from_f32(x.shape.clone(), out))
     }
 
+    /// GatedDeltaNet's per-head delta-rule recurrence step (ops.md
+    /// §"GatedDeltaNet") — decay `state` in place, rank-1-update it
+    /// from `(q_t, k_t, v_t, decay, beta)`, return this token's output.
+    /// `state`: `[num_heads, head_k_dim, head_v_dim]`, READ-MODIFY-
+    /// WRITE. `q_t`/`k_t`: `[num_heads, head_k_dim]`. `v_t`:
+    /// `[num_heads, head_v_dim]`. `decay`/`beta`: `[num_heads]`. Same
+    /// math as `backend::cpu::gated_delta::recurrence_step`, one call
+    /// per head there — batched over all heads here so a GPU backend
+    /// can parallelize across the whole `num_heads * head_v_dim` grid
+    /// in one dispatch. Returns `[num_heads, head_v_dim]`.
+    ///
+    /// Default: CPU reference, one `recurrence_step` call per head.
+    /// GPU backends override with a persistent-state kernel.
+    fn gated_delta_recurrence_step(
+        &self,
+        state: &mut [f32],
+        q_t: &[f32],
+        k_t: &[f32],
+        v_t: &[f32],
+        decay: &[f32],
+        beta: &[f32],
+        num_heads: usize,
+        head_k_dim: usize,
+        head_v_dim: usize,
+    ) -> Result<Vec<f32>, BackendError> {
+        let mut out = vec![0f32; num_heads * head_v_dim];
+        for hi in 0..num_heads {
+            let st = &mut state[hi * head_k_dim * head_v_dim..(hi + 1) * head_k_dim * head_v_dim];
+            let out_row = &mut out[hi * head_v_dim..(hi + 1) * head_v_dim];
+            crate::backend::cpu::gated_delta::recurrence_step(
+                st,
+                &q_t[hi * head_k_dim..(hi + 1) * head_k_dim],
+                &k_t[hi * head_k_dim..(hi + 1) * head_k_dim],
+                &v_t[hi * head_v_dim..(hi + 1) * head_v_dim],
+                decay[hi],
+                beta[hi],
+                head_k_dim,
+                head_v_dim,
+                out_row,
+            );
+        }
+        Ok(out)
+    }
+
     fn silu_mul(&self, gate: &Tensor, up: &Tensor) -> Result<Tensor, BackendError> {
         // Default falls back to host f32 path.
         let g = if let Some(b) = gate.as_host_bytes() {

@@ -86,6 +86,10 @@ name = "mrope_honeycrisp"
 path = "tests/mrope_honeycrisp.rs"
 
 [[test]]
+name = "gated_delta_honeycrisp"
+path = "tests/gated_delta_honeycrisp.rs"
+
+[[test]]
 name = "tier4_ir_exec"
 path = "tests/tier4_ir_exec.rs"
 
