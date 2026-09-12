@@ -24,7 +24,7 @@
 //! Spec: specs/gated-delta-vl-plan.md's wiring progress entries.
 
 use run::arch::decoder::{LlamaModel, TokenOverride};
-use run::backend::cpu::vision::{vision_tower_forward, VisionBlockWeights, VisionDims, VisionMergerWeights};
+use run::backend::cpu::vision::{vision_tower_forward, VisionBlockWeights, VisionDims};
 use run::backend::cpu::mrope::{mrope_position_ids, ModalityRun};
 use run::backend::cpu::CpuBackend;
 use run::core::tensor::Tensor;
@@ -59,14 +59,6 @@ fn load(name: &str) -> Tensor {
     Tensor::from_f32(shape, data)
 }
 
-fn load_patch_embed_weight() -> Tensor {
-    let (shape, data) = read_dump(&PathBuf::from(GOLDEN_DIR).join("w_patch_embed.proj.weight.bin"));
-    assert_eq!(shape.len(), 5, "expected Conv3d [hidden, C, T, P, P]");
-    let hidden = shape[0];
-    let k: usize = shape[1..].iter().product();
-    Tensor::from_f32(vec![hidden, k], data)
-}
-
 #[test]
 fn e2e_multimodal_sequential_decode_matches_real_hf_forward() {
     if !PathBuf::from(GOLDEN_DIR).join("logits.bin").exists() || !PathBuf::from(MODEL_PATH).exists() {
@@ -88,56 +80,29 @@ fn e2e_multimodal_sequential_decode_matches_real_hf_forward() {
     let seq_len = input_ids.len();
     assert_eq!(mm_types.len(), seq_len);
 
-    // ── 1. Vision tower: real weights, real forward, same as vision_golden.rs ──
+    // ── 1. Load the REAL runtime model — this also loads the vision
+    // tower's own weights via Weights::load, exercising that path too
+    // (previously only tested via manual golden-dump loading). ──
+    let mut model = LlamaModel::load(Path::new(MODEL_PATH)).expect("load tiny model");
     let pixel_values = load("pixel_values");
-    let patch_embed_weight = load_patch_embed_weight();
-    let patch_embed_bias = load("w_patch_embed.proj.bias");
-    let pos_embed_table = load("w_pos_embed.weight");
-    let norm1_w = load("w_blocks.0.norm1.weight");
-    let norm1_b = load("w_blocks.0.norm1.bias");
-    let norm2_w = load("w_blocks.0.norm2.weight");
-    let norm2_b = load("w_blocks.0.norm2.bias");
-    let qkv_w = load("w_blocks.0.attn.qkv.weight");
-    let qkv_b = load("w_blocks.0.attn.qkv.bias");
-    let proj_w = load("w_blocks.0.attn.proj.weight");
-    let proj_b = load("w_blocks.0.attn.proj.bias");
-    let fc1_w = load("w_blocks.0.mlp.linear_fc1.weight");
-    let fc1_b = load("w_blocks.0.mlp.linear_fc1.bias");
-    let fc2_w = load("w_blocks.0.mlp.linear_fc2.weight");
-    let fc2_b = load("w_blocks.0.mlp.linear_fc2.bias");
-    let blocks = vec![VisionBlockWeights {
-        norm1_weight: &norm1_w, norm1_bias: &norm1_b,
-        norm2_weight: &norm2_w, norm2_bias: &norm2_b,
-        qkv_weight: &qkv_w, qkv_bias: &qkv_b,
-        proj_weight: &proj_w, proj_bias: &proj_b,
-        fc1_weight: &fc1_w, fc1_bias: &fc1_b,
-        fc2_weight: &fc2_w, fc2_bias: &fc2_b,
-    }];
-    let merger_norm_w = load("w_merger.norm.weight");
-    let merger_norm_b = load("w_merger.norm.bias");
-    let merger_fc1_w = load("w_merger.linear_fc1.weight");
-    let merger_fc1_b = load("w_merger.linear_fc1.bias");
-    let merger_fc2_w = load("w_merger.linear_fc2.weight");
-    let merger_fc2_b = load("w_merger.linear_fc2.bias");
-    let merger = VisionMergerWeights {
-        norm_weight: &merger_norm_w, norm_bias: &merger_norm_b,
-        fc1_weight: &merger_fc1_w, fc1_bias: &merger_fc1_b,
-        fc2_weight: &merger_fc2_w, fc2_bias: &merger_fc2_b,
-    };
+    let vc = model.config.vision.expect("model must have a vision config");
+    let vw = model.weights.vision.as_ref().expect("model must have loaded vision weights");
+    let blocks: Vec<VisionBlockWeights> = vw.blocks.iter().map(|b| b.as_ref()).collect();
+    let merger = vw.merger.as_ref();
     let vdims = VisionDims {
-        hidden_size: meta["vision_hidden_size"].as_u64().unwrap() as usize,
-        num_heads: meta["vision_num_heads"].as_u64().unwrap() as usize,
-        intermediate_size: meta["vision_intermediate_size"].as_u64().unwrap() as usize,
+        hidden_size: vc.hidden_size,
+        num_heads: vc.num_heads,
+        intermediate_size: vc.intermediate_size,
         spatial_merge_size,
-        num_grid_per_side: meta["vision_num_grid_per_side"].as_u64().unwrap() as usize,
-        rope_theta: meta["vision_rope_theta"].as_f64().unwrap() as f32,
-        out_hidden_size: meta["vision_out_hidden_size"].as_u64().unwrap() as usize,
+        num_grid_per_side: (vc.num_position_embeddings as f64).sqrt() as usize,
+        rope_theta: vc.rope_theta,
+        out_hidden_size: vc.out_hidden_size,
     };
     let (grid_t, grid_h, grid_w) = (grid_thw[0], grid_thw[1], grid_thw[2]);
     assert_eq!(grid_t, 1, "test only handles a single image frame");
     let image_embeds = vision_tower_forward(
         &pixel_values, grid_h, grid_w,
-        &patch_embed_weight, &patch_embed_bias, &pos_embed_table,
+        &vw.patch_embed_weight, &vw.patch_embed_bias, &vw.pos_embed_table,
         &blocks, &merger, vdims,
     )
     .expect("vision tower forward");
@@ -168,7 +133,6 @@ fn e2e_multimodal_sequential_decode_matches_real_hf_forward() {
     let (positions, _next_pos) = mrope_position_ids(&runs, spatial_merge_size);
 
     // ── 3. Sequential decode through the REAL runtime, one token at a time ──
-    let mut model = LlamaModel::load(Path::new(MODEL_PATH)).expect("load tiny model");
     let backend = CpuBackend::new();
     let mut image_idx = 0usize;
     let mut ours_logits = vec![0f32; seq_len * (meta["vocab_size"].as_u64().unwrap() as usize)];

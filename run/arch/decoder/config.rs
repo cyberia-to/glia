@@ -100,6 +100,32 @@ pub struct LlamaConfig {
     pub linear_key_head_dim: Option<usize>,
     pub linear_value_head_dim: Option<usize>,
     pub linear_conv_kernel_dim: Option<usize>,
+
+    // ── Native VL (Qwen3.5/3.8) — vision tower + fusion ──
+    // Spec: ops.md §"VisionTower". `None` for text-only models.
+    pub vision: Option<VisionConfig>,
+    pub image_token_id: Option<u32>,
+    pub video_token_id: Option<u32>,
+    pub vision_start_token_id: Option<u32>,
+    pub vision_end_token_id: Option<u32>,
+}
+
+/// `[architecture.vision]` — the native VL vision tower's own config,
+/// separate from the text decoder's `hidden_size`/etc. Spec: ops.md
+/// §"VisionTower".
+#[derive(Clone, Copy, Debug)]
+pub struct VisionConfig {
+    pub hidden_size: usize,
+    pub num_heads: usize,
+    pub intermediate_size: usize,
+    pub depth: usize,
+    pub patch_size: usize,
+    pub in_channels: usize,
+    pub spatial_merge_size: usize,
+    pub temporal_patch_size: usize,
+    pub num_position_embeddings: usize,
+    pub out_hidden_size: usize,
+    pub rope_theta: f32,
 }
 
 impl LlamaConfig {
@@ -410,6 +436,31 @@ impl LlamaConfig {
             .and_then(|v| v.as_integer())
             .map(|i| i as usize);
 
+        let image_token_id = arch.get("image_token_id").and_then(|v| v.as_integer()).map(|i| i as u32);
+        let video_token_id = arch.get("video_token_id").and_then(|v| v.as_integer()).map(|i| i as u32);
+        let vision_start_token_id =
+            arch.get("vision_start_token_id").and_then(|v| v.as_integer()).map(|i| i as u32);
+        let vision_end_token_id =
+            arch.get("vision_end_token_id").and_then(|v| v.as_integer()).map(|i| i as u32);
+        let vision = arch.get("vision").map(|vc| {
+            let vget = |key: &str, default: usize| -> usize {
+                vc.get(key).and_then(|v| v.as_integer()).map(|i| i as usize).unwrap_or(default)
+            };
+            VisionConfig {
+                hidden_size: vget("hidden_size", 1152),
+                num_heads: vget("num_heads", 16),
+                intermediate_size: vget("intermediate_size", 4304),
+                depth: vget("depth", 27),
+                patch_size: vget("patch_size", 16),
+                in_channels: vget("in_channels", 3),
+                spatial_merge_size: vget("spatial_merge_size", 2),
+                temporal_patch_size: vget("temporal_patch_size", 2),
+                num_position_embeddings: vget("num_position_embeddings", 2304),
+                out_hidden_size: vget("out_hidden_size", hidden_size),
+                rope_theta: vc.get("rope_theta").and_then(|v| v.as_integer()).map(|i| i as f32).unwrap_or(10000.0),
+            }
+        });
+
         Ok(Self {
             model_type,
             hidden_size,
@@ -443,6 +494,11 @@ impl LlamaConfig {
             linear_key_head_dim,
             linear_value_head_dim,
             linear_conv_kernel_dim,
+            vision,
+            image_token_id,
+            video_token_id,
+            vision_start_token_id,
+            vision_end_token_id,
         })
     }
 }

@@ -234,6 +234,21 @@ pub fn import_snapshot(
         .and_then(|p| p.get("mrope_section"))
         .and_then(|v| v.as_array())
         .map(|a| a.iter().filter_map(|v| v.as_u64()).collect());
+
+    // Native VL (Qwen3.5/3.8): vision tower config + fusion IDs live on
+    // the OUTER config (sibling of text_config), not inside it. Spec:
+    // ops.md §"VisionTower". Absent entirely for text-only models.
+    let vision_config = config_json.get("vision_config");
+    let vision_rope_theta = vision_config
+        .and_then(|v| v.get("rope_parameters"))
+        .and_then(|r| r.get("rope_theta"))
+        .and_then(|v| v.as_f64())
+        .unwrap_or(10000.0);
+    let image_token_id = config_json["image_token_id"].as_u64();
+    let video_token_id = config_json["video_token_id"].as_u64();
+    let vision_start_token_id = config_json["vision_start_token_id"].as_u64();
+    let vision_end_token_id = config_json["vision_end_token_id"].as_u64();
+
     let rms_norm_eps = text_config["rms_norm_eps"].as_f64().unwrap_or(1e-6);
     let tie_word_embeddings = text_config["tie_word_embeddings"]
         .as_bool()
@@ -339,6 +354,52 @@ pub fn import_snapshot(
             llamaplus.push_str(&format!("mrope_section = [{}, {}, {}]\n", ms[0], ms[1], ms[2]));
         }
     }
+    if let Some(id) = image_token_id {
+        llamaplus.push_str(&format!("image_token_id = {id}\n"));
+    }
+    if let Some(id) = video_token_id {
+        llamaplus.push_str(&format!("video_token_id = {id}\n"));
+    }
+    if let Some(id) = vision_start_token_id {
+        llamaplus.push_str(&format!("vision_start_token_id = {id}\n"));
+    }
+    if let Some(id) = vision_end_token_id {
+        llamaplus.push_str(&format!("vision_end_token_id = {id}\n"));
+    }
+
+    // [architecture.vision] — native VL tower config (ops.md
+    // §"VisionTower"). Only emitted when the source config has one.
+    let vision_section = if let Some(vc) = vision_config {
+        format!(
+            r#"
+[architecture.vision]
+hidden_size = {}
+num_heads = {}
+intermediate_size = {}
+depth = {}
+patch_size = {}
+in_channels = {}
+spatial_merge_size = {}
+temporal_patch_size = {}
+num_position_embeddings = {}
+out_hidden_size = {}
+rope_theta = {}
+"#,
+            vc["hidden_size"].as_u64().unwrap_or(1152),
+            vc["num_heads"].as_u64().unwrap_or(16),
+            vc["intermediate_size"].as_u64().unwrap_or(4304),
+            vc["depth"].as_u64().unwrap_or(27),
+            vc["patch_size"].as_u64().unwrap_or(16),
+            vc["in_channels"].as_u64().unwrap_or(3),
+            vc["spatial_merge_size"].as_u64().unwrap_or(2),
+            vc["temporal_patch_size"].as_u64().unwrap_or(2),
+            vc["num_position_embeddings"].as_u64().unwrap_or(2304),
+            vc["out_hidden_size"].as_u64().unwrap_or(hidden_size),
+            vision_rope_theta.round() as u64,
+        )
+    } else {
+        String::new()
+    };
 
     // Canonical config — integers only. eps stored as 1/ε; rope_theta is
     // already integer-valued in source (10000, 500000, 1_000_000 etc.).
@@ -365,7 +426,7 @@ max_position_embeddings = {max_pos}
 rope_theta = {rope_theta_int}
 rms_norm_eps = {rms_norm_eps_inv}
 tie_word_embeddings = {tie_word_embeddings}
-{llamaplus}
+{llamaplus}{vision_section}
 [tokenizer]
 type = "bpe"
 eos_token = "{eos_token}"

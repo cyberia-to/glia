@@ -96,6 +96,75 @@ pub struct Weights {
     /// reads and contributed to `run/specs/gated-delta-vl-plan.md`'s
     /// "still doesn't run end-to-end" finding.
     pub embed_tokens_quant: QuantWeight,
+    /// Native VL (Qwen3.5/3.8) vision tower — `None` for text-only
+    /// models. Spec: ops.md §"VisionTower".
+    pub vision: Option<VisionWeights>,
+}
+
+/// One vision block's weights, owned (vs. `vision::VisionBlockWeights`,
+/// which borrows — `as_ref()` builds that borrowed view for a call).
+pub struct VisionBlockOwned {
+    pub norm1_weight: Tensor,
+    pub norm1_bias: Tensor,
+    pub norm2_weight: Tensor,
+    pub norm2_bias: Tensor,
+    pub qkv_weight: Tensor,
+    pub qkv_bias: Tensor,
+    pub proj_weight: Tensor,
+    pub proj_bias: Tensor,
+    pub fc1_weight: Tensor,
+    pub fc1_bias: Tensor,
+    pub fc2_weight: Tensor,
+    pub fc2_bias: Tensor,
+}
+
+impl VisionBlockOwned {
+    pub fn as_ref(&self) -> crate::backend::cpu::vision::VisionBlockWeights<'_> {
+        crate::backend::cpu::vision::VisionBlockWeights {
+            norm1_weight: &self.norm1_weight,
+            norm1_bias: &self.norm1_bias,
+            norm2_weight: &self.norm2_weight,
+            norm2_bias: &self.norm2_bias,
+            qkv_weight: &self.qkv_weight,
+            qkv_bias: &self.qkv_bias,
+            proj_weight: &self.proj_weight,
+            proj_bias: &self.proj_bias,
+            fc1_weight: &self.fc1_weight,
+            fc1_bias: &self.fc1_bias,
+            fc2_weight: &self.fc2_weight,
+            fc2_bias: &self.fc2_bias,
+        }
+    }
+}
+
+pub struct VisionMergerOwned {
+    pub norm_weight: Tensor,
+    pub norm_bias: Tensor,
+    pub fc1_weight: Tensor,
+    pub fc1_bias: Tensor,
+    pub fc2_weight: Tensor,
+    pub fc2_bias: Tensor,
+}
+
+impl VisionMergerOwned {
+    pub fn as_ref(&self) -> crate::backend::cpu::vision::VisionMergerWeights<'_> {
+        crate::backend::cpu::vision::VisionMergerWeights {
+            norm_weight: &self.norm_weight,
+            norm_bias: &self.norm_bias,
+            fc1_weight: &self.fc1_weight,
+            fc1_bias: &self.fc1_bias,
+            fc2_weight: &self.fc2_weight,
+            fc2_bias: &self.fc2_bias,
+        }
+    }
+}
+
+pub struct VisionWeights {
+    pub patch_embed_weight: Tensor,
+    pub patch_embed_bias: Tensor,
+    pub pos_embed_table: Tensor,
+    pub blocks: Vec<VisionBlockOwned>,
+    pub merger: VisionMergerOwned,
 }
 
 impl Weights {
@@ -172,11 +241,17 @@ impl Weights {
             layers.push(layer);
         }
 
+        let vision = match &config.vision {
+            Some(vc) => Some(load_vision_weights(lm, vc)?),
+            None => None,
+        };
+
         Ok(Self {
             embed_tokens_quant,
             layers,
             final_norm,
             lm_head,
+            vision,
         })
     }
 
@@ -303,6 +378,59 @@ fn load_quant_weight_reshaped(
         data: TensorData::Host(qw.bytes.clone()),
     };
     Ok(qw)
+}
+
+/// Load the native VL vision tower — `model.visual.*` tensors, plain
+/// f32 throughout (the whole tower is ~460M params / ~1.8GB f32, no
+/// memory pressure to trade correctness-first simplicity away for —
+/// see `backend::cpu::vision`'s module doc). Spec: ops.md
+/// §"VisionTower".
+fn load_vision_weights(
+    lm: &LoadedModel,
+    vc: &super::config::VisionConfig,
+) -> Result<VisionWeights, FormatError> {
+    let patch_dim = vc.in_channels * vc.temporal_patch_size * vc.patch_size * vc.patch_size;
+    // Declared as Conv3d [hidden, C, T, P, P] in the source; flatten the
+    // trailing 4 dims into one K axis for matmul (the degenerate-
+    // Conv3d-as-matmul equivalence, ops.md §"VisionTower" step 1).
+    let patch_embed_weight =
+        load_tensor_f32_reshaped(lm, "model.visual.patch_embed.proj.weight", vec![vc.hidden_size, patch_dim])?;
+    let patch_embed_bias = load_tensor_f32(lm, "model.visual.patch_embed.proj.bias")?;
+    let pos_embed_table = load_tensor_f32_reshaped(
+        lm,
+        "model.visual.pos_embed.weight",
+        vec![vc.num_position_embeddings, vc.hidden_size],
+    )?;
+
+    let mut blocks = Vec::with_capacity(vc.depth);
+    for i in 0..vc.depth {
+        let p = format!("model.visual.blocks.{i}");
+        blocks.push(VisionBlockOwned {
+            norm1_weight: load_tensor_f32(lm, &format!("{p}.norm1.weight"))?,
+            norm1_bias: load_tensor_f32(lm, &format!("{p}.norm1.bias"))?,
+            norm2_weight: load_tensor_f32(lm, &format!("{p}.norm2.weight"))?,
+            norm2_bias: load_tensor_f32(lm, &format!("{p}.norm2.bias"))?,
+            qkv_weight: load_tensor_f32(lm, &format!("{p}.attn.qkv.weight"))?,
+            qkv_bias: load_tensor_f32(lm, &format!("{p}.attn.qkv.bias"))?,
+            proj_weight: load_tensor_f32(lm, &format!("{p}.attn.proj.weight"))?,
+            proj_bias: load_tensor_f32(lm, &format!("{p}.attn.proj.bias"))?,
+            fc1_weight: load_tensor_f32(lm, &format!("{p}.mlp.linear_fc1.weight"))?,
+            fc1_bias: load_tensor_f32(lm, &format!("{p}.mlp.linear_fc1.bias"))?,
+            fc2_weight: load_tensor_f32(lm, &format!("{p}.mlp.linear_fc2.weight"))?,
+            fc2_bias: load_tensor_f32(lm, &format!("{p}.mlp.linear_fc2.bias"))?,
+        });
+    }
+
+    let merger = VisionMergerOwned {
+        norm_weight: load_tensor_f32(lm, "model.visual.merger.norm.weight")?,
+        norm_bias: load_tensor_f32(lm, "model.visual.merger.norm.bias")?,
+        fc1_weight: load_tensor_f32(lm, "model.visual.merger.linear_fc1.weight")?,
+        fc1_bias: load_tensor_f32(lm, "model.visual.merger.linear_fc1.bias")?,
+        fc2_weight: load_tensor_f32(lm, "model.visual.merger.linear_fc2.weight")?,
+        fc2_bias: load_tensor_f32(lm, "model.visual.merger.linear_fc2.bias")?,
+    };
+
+    Ok(VisionWeights { patch_embed_weight, patch_embed_bias, pos_embed_table, blocks, merger })
 }
 
 fn load_layer(
