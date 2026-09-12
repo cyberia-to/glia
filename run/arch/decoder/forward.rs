@@ -29,6 +29,12 @@ pub struct LlamaModel {
     /// mutated in place every call — the KV-cache analogue for layers
     /// that carry no KV cache at all.
     pub gdn_state: Vec<Option<Vec<f32>>>,
+    /// GatedDeltaNet causal-conv1d left-context cache per layer —
+    /// `Some([conv_dim * (kernel_size-1)])` for `LinearAttn` layers,
+    /// `None` otherwise. See `gated_delta::gated_delta_forward`'s doc
+    /// comment: without this, every decode step's conv1d silently
+    /// treats itself as the first token of a fresh sequence.
+    pub gdn_conv_state: Vec<Option<Vec<f32>>>,
     /// Per-op timing accumulator. Reset via `reset_prof`, read via `prof`.
     pub prof: ForwardProf,
 }
@@ -155,12 +161,27 @@ impl LlamaModel {
                 Some(vec![0f32; sz])
             })
             .collect();
+        let gdn_conv_state = (0..config.num_hidden_layers)
+            .map(|i| {
+                let is_linear_attn = config.layer_types.get(i).copied()
+                    == Some(super::config::LayerKind::LinearAttn);
+                if !is_linear_attn {
+                    return None;
+                }
+                let key_dim = config.linear_num_key_heads.unwrap_or(0) * config.linear_key_head_dim.unwrap_or(0);
+                let value_dim = config.linear_num_value_heads.unwrap_or(0) * config.linear_value_head_dim.unwrap_or(0);
+                let conv_dim = key_dim * 2 + value_dim;
+                let kernel_size = config.linear_conv_kernel_dim.unwrap_or(1);
+                Some(vec![0f32; conv_dim * kernel_size.saturating_sub(1)])
+            })
+            .collect();
         Ok(Self {
             config,
             weights,
             past_seq_len: 0,
             kv_cache,
             gdn_state,
+            gdn_conv_state,
             prof: ForwardProf::default(),
         })
     }
@@ -240,6 +261,9 @@ impl LlamaModel {
         // real, not just logically forgotten, or a new conversation would
         // start from the previous one's recurrent state.
         for s in self.gdn_state.iter_mut().flatten() {
+            s.fill(0.0);
+        }
+        for s in self.gdn_conv_state.iter_mut().flatten() {
             s.fill(0.0);
         }
     }
@@ -441,7 +465,7 @@ impl LlamaModel {
                     hidden = forward_layer(
                         &hidden, li, &self.weights.layers[li], c, &pos_tensor, backend,
                         &mut self.kv_cache[li], self.past_seq_len, None,
-                        self.gdn_state[li].as_deref_mut(), None,
+                        self.gdn_state[li].as_deref_mut(), self.gdn_conv_state[li].as_deref_mut(), None,
                     )?;
                     li += 1;
                     any_fused = true; // "handled", not literally a fused-GPU group
@@ -487,7 +511,7 @@ impl LlamaModel {
                             hidden = forward_layer(
                                 &hidden, i, &self.weights.layers[i], c, &pos_tensor, backend,
                                 &mut self.kv_cache[i], self.past_seq_len, None,
-                                self.gdn_state[i].as_deref_mut(), None,
+                                self.gdn_state[i].as_deref_mut(), self.gdn_conv_state[i].as_deref_mut(), None,
                             )?;
                         }
                         li = gi;
@@ -509,6 +533,7 @@ impl LlamaModel {
                     self.past_seq_len,
                     if prof_enabled { Some(&mut self.prof) } else { None },
                     self.gdn_state[i].as_deref_mut(),
+                    self.gdn_conv_state[i].as_deref_mut(),
                     mrope_pos,
                 )?;
                 if debug_layers {
@@ -631,6 +656,7 @@ fn forward_layer(
     past_seq_len: usize,
     prof: Option<&mut ForwardProf>,
     gdn_state: Option<&mut [f32]>,
+    gdn_conv_state: Option<&mut [f32]>,
     mrope_pos: Option<[f32; 3]>,
 ) -> Result<Tensor, BackendError> {
     use std::time::Instant;
@@ -681,6 +707,11 @@ fn forward_layer(
                 "layer {layer_idx}: linear_attention layer called without a GatedDeltaNet state buffer"
             )));
         };
+        let Some(conv_state) = gdn_conv_state else {
+            return Err(BackendError::Internal(format!(
+                "layer {layer_idx}: linear_attention layer called without a GatedDeltaNet conv_state buffer"
+            )));
+        };
         let normed = backend
             .execute(&Op::RmsNorm { eps }, &[hidden, &layer.input_norm])?
             .remove(0);
@@ -713,7 +744,7 @@ fn forward_layer(
             out_proj: &out_proj,
         };
         let gdn_out = crate::backend::cpu::gated_delta::gated_delta_forward(
-            &normed_f32, &weights, dims, eps, state,
+            &normed_f32, &weights, dims, eps, state, conv_state,
         )?;
         let h1 = backend.execute(&Op::Add, &[hidden, &gdn_out])?.remove(0);
         acc_attention += t_gdn.elapsed().as_secs_f64() * 1000.0;

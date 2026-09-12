@@ -70,6 +70,10 @@ name = "gated_delta_golden"
 path = "tests/gated_delta_golden.rs"
 
 [[test]]
+name = "gated_delta_conv_state"
+path = "tests/gated_delta_conv_state.rs"
+
+[[test]]
 name = "vision_golden"
 path = "tests/vision_golden.rs"
 

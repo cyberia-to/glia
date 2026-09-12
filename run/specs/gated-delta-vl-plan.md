@@ -595,3 +595,97 @@ written here.
 Still open: the image preprocessor (real image file → `pixel_values`
 + `grid_thw`) — without it there is still no way to construct a real
 multimodal prompt at all, tested or not.
+
+## Progress — 2026-09-12, GatedDeltaNet's missing conv1d cross-call state, found + fixed
+
+While starting the honeycrisp GPU kernel work (below), re-read
+`Qwen3_5GatedDeltaNet.forward` closely enough to notice
+`cache_params.layers[i].conv_states[0]` — a SECOND piece of cross-call
+state this runtime never carried. `gated_delta_forward`'s `state`
+parameter only ever covered the delta-rule recurrence
+(`[num_v_heads, head_k_dim, head_v_dim]`); the causal depthwise
+conv1d step had no left-context cache at all, so every `T=1` decode
+call (the ONLY shape `forward.rs`'s decode loop issues — one token
+per `forward()` call, always) implicitly zero-padded as if it were
+the first token of a brand new sequence. Wrong for every decode step
+after the first, for every one of the model's 48 `linear_attention`
+layers — silent, no crash, and invisible to the existing golden test
+specifically because that test's own T=6-in-one-call shape never
+exercises the cross-call path (a single multi-token call has real
+history for every position it needs, by construction).
+
+Fixed: `gated_delta_forward` gained a `conv_state: &mut [f32]`
+parameter (`[conv_dim, kernel_size-1]`, oldest-to-newest), matching
+HF's `causal_conv1d_update` exactly (verified against its real source
+in `modeling_qwen3_5.py:250`, not guessed). `forward.rs`'s
+`LlamaModel` gained a parallel `gdn_conv_state: Vec<Option<Vec<f32>>>`
+field (same per-layer-lazy-alloc, zeroed-on-`reset_kv_cache` pattern
+as `gdn_state`), threaded through `forward_layer` the same way.
+
+New test `run/tests/gated_delta_conv_state.rs` proves the fix: reuses
+the existing golden dump's real T=6 weights+input+output, runs 6
+SEQUENTIAL T=1 calls chaining both `state` and `conv_state` (exactly
+how the live decode loop calls this), and checks the stacked output
+against the real HF T=6-in-one-call reference — worst abs diff
+1.8e-8. This is the actual property the decode loop depends on and
+that was silently false before `conv_state` existed; the original
+`gated_delta_golden.rs` test (still green, unaffected — zero
+`conv_state` on a fresh conversation reproduces the old zero-padding
+behavior exactly, so a first call is unaffected either way) was never
+sufficient evidence that live decoding worked correctly.
+
+Byte-for-byte regression-checked against the 8B model (no
+GatedDeltaNet layers, `conv_state` vectors are always empty for it) —
+identical output before/after, full lib test suite green.
+
+## Progress — 2026-09-12, honeycrisp GPU kernels — mRoPE done + verified, GatedDeltaNet started
+
+Investigated honeycrisp's structure first (see the Explore agent's
+findings, not re-duplicated here): the live hot path never goes
+through the generic `Op`-based `Backend::execute` dispatch for
+anything but `Matmul`/`RmsNorm`/`Silu`/`Add` — attention, RoPE, and
+KV-cache append are all bespoke `Backend` trait methods
+(`gpu_attention`, `fused_attn_oproj_residual`, `forward_decode_fused_layers`,
+...) with CPU-composition default bodies, overridden per-backend. New
+GPU work follows this same shape, not an `Op` variant.
+
+**mRoPE — done and verified on real hardware.** New `Backend` trait
+method `apply_mrope_cos_sin` (CPU default → `apply_rope_cos_sin_f32`);
+honeycrisp overrides with a real Metal kernel
+(`run/backend/honeycrisp/kernels/mrope.rs`) implementing the SAME
+contiguous-rope_dim-prefix convention (deliberately NOT reusing the
+existing `kernels::rope` MSL kernels — those implement Gemma-4's
+different interleaved-pairs layout, see ops.md). Pipelines are
+lazily compiled and cached per `(head_dim, rope_dim)`.
+`run/tests/mrope_honeycrisp.rs` constructs a REAL `HoneycrispBackend`
+on this machine and runs the actual kernel against the mRoPE golden
+dump's real HF cos/sin/Q data — worst diff 2.98e-8. This is the one
+piece of the whole Qwen3.8 GPU effort that's genuinely end-to-end
+tested right now, because it doesn't need the 27B model in memory at
+all — just a working Metal device (which this machine has) and the
+small golden dump.
+
+**GatedDeltaNet GPU kernel — not yet started** (as of this entry).
+Per the Explore agent's findings: this would be the FIRST persistent-
+mutable-state-across-dispatch-calls GPU kernel in the codebase (KV-
+cache append is the closest precedent — a persistent GPU buffer keyed
+by layer_idx, mutated in place every token — but it's a pure write,
+never a read-decay-update-write cycle). For `T=1` decode (this
+runtime's only real shape), the recurrence itself is NOT sequential
+across threads within one dispatch — it's one independent
+read-modify-write per head, embarrassingly parallel across the
+`num_v_heads` heads (48 for the 27B model), each one small (a
+`[128,128]` state matrix). The actual work is: conv1d-with-cache-update
+(small, cheap), the 4 in_proj matmuls (already have honeycrisp
+matmul/quant_matmul kernels — reusable, not new), the gate math
+(cheap elementwise), and the state update itself (one MSL kernel, one
+threadgroup per head). Explicitly OUT of scope for
+`forward_decode_fused_layers` (the cross-layer batch path) — per that
+function's own existing `is_linear_attn` bail-out and this plan's
+earlier entry, GatedDeltaNet gets its own per-layer dispatch, same as
+CPU. Next step: write the state-update MSL kernel first (smallest,
+most novel piece), verify it against `cpu::gated_delta`'s already-HF-
+verified math on synthetic small tensors (same "test on real hardware
+without the 27B model" trick that worked for mRoPE), then decide
+whether the surrounding matmuls/conv/gates are worth fusing into one
+dispatch or left as separate calls to existing kernels.

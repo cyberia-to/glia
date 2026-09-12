@@ -104,7 +104,13 @@ fn gated_delta_matches_hf_reference_on_real_weights() {
     };
 
     let mut state = vec![0f32; dims.num_v_heads * dims.head_k_dim * dims.head_v_dim];
-    let ours = gated_delta_forward(&x, &weights, dims, 1e-6, &mut state).expect("forward");
+    // Zero conv_state == this call is the whole conversation's first —
+    // identical to the old implicit-zero-padding behavior this golden
+    // test already verified, so the T=6 comparison below is unaffected
+    // by conv_state's addition (see run/tests/gated_delta_conv_state.rs
+    // for the cross-call-history behavior conv_state actually exists for).
+    let mut conv_state = vec![0f32; conv_shape[0] * (dims.conv_kernel_size - 1)];
+    let ours = gated_delta_forward(&x, &weights, dims, 1e-6, &mut state, &mut conv_state).expect("forward");
     let (hf_shape, hf_data) = read_dump(&PathBuf::from(DIR).join("output.bin"));
     assert_eq!(ours.shape, hf_shape, "output shape mismatch");
 

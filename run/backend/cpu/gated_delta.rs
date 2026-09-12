@@ -60,13 +60,28 @@ impl GatedDeltaDims {
 /// `reset_kv_cache` zeroes the Sdpa cache); every call after that reads
 /// and updates it — there is no separate "prefill" mode, a run of T>1
 /// calls with the same buffer is mathematically identical to T separate
-/// calls of length 1 each (the recurrence has no lookahead).
+/// calls of length 1 each (the recurrence has no lookahead), PROVIDED
+/// `conv_state` is also carried across calls (see its own doc below) —
+/// without it, that "T calls of length 1 == one call of length T" claim
+/// is false for anything but the conv1d step's very first token.
+///
+/// `conv_state`: `[conv_dim, kernel_size-1]`, the causal conv1d's
+/// left-context cache — HF's `cache_params.layers[i].conv_states[0]`
+/// (`causal_conv1d_update`). Oldest-to-newest per channel. Zero it
+/// alongside `state` on a fresh conversation; every call updates it in
+/// place with its trailing `kernel_size-1` (history ++ this call's `x`)
+/// values, so the NEXT call sees genuine left-context instead of
+/// implicit zero-padding. Missing this (as this function did before
+/// 2026-09-12) makes every decode step after the first treat itself as
+/// the start of a brand new sequence for the conv1d step specifically —
+/// wrong output, no crash, no shape mismatch to catch it.
 pub fn gated_delta_forward(
     x: &Tensor,
     w: &GatedDeltaWeights,
     dims: GatedDeltaDims,
     eps: f32,
     state: &mut [f32],
+    conv_state: &mut [f32],
 ) -> Result<Tensor, BackendError> {
     if x.rank() != 2 {
         return Err(BackendError::ShapeMismatch {
@@ -86,9 +101,11 @@ pub fn gated_delta_forward(
     let b = matmul_f32(x, w.in_proj_b)?; // [T, num_v_heads]
     let a = matmul_f32(x, w.in_proj_a)?; // [T, num_v_heads]
 
-    // 2. Causal depthwise conv along T, then SiLU. Left-padded by
-    //    kernel_size-1 zeros so position i only ever sees i-k+1..=i.
-    let mixed_qkv = causal_depthwise_conv1d_silu(&mixed_qkv, w.conv1d_weight, cd, dims.conv_kernel_size)?;
+    // 2. Causal depthwise conv along T, then SiLU. Left-padded by real
+    //    cross-call history (`conv_state`), not implicit zeros.
+    let mixed_qkv = causal_depthwise_conv1d_silu(
+        &mixed_qkv, w.conv1d_weight, cd, dims.conv_kernel_size, conv_state,
+    )?;
 
     // 3. Split into query/key/value and reshape to per-head.
     let mq = mixed_qkv.as_f32();
@@ -270,13 +287,21 @@ fn l2_normalize_into(src: &[f32], dst: &mut [f32], eps: f32) {
 }
 
 /// Depthwise causal 1D conv (groups = channels, no bias) + SiLU, fused —
-/// exactly `causal_conv1d_fn(..., activation="silu")` in the reference.
+/// exactly `causal_conv1d_fn`/`causal_conv1d_update` (`activation="silu"`)
+/// in the reference, generalized to work identically for both (T>1,
+/// `conv_state` all-zero — first call of a conversation) and (T=1,
+/// `conv_state` populated — every decode step after that).
+///
 /// `x`: `[T, C]`. `weight`: `[C, K]` (one length-K kernel per channel).
+/// `conv_state`: `[C, K-1]`, oldest-to-newest, read as this call's left
+/// context and OVERWRITTEN in place with the trailing `K-1` values of
+/// `history ++ x` for the next call — see `gated_delta_forward`'s doc.
 fn causal_depthwise_conv1d_silu(
     x: &Tensor,
     weight: &Tensor,
     channels: usize,
     kernel_size: usize,
+    conv_state: &mut [f32],
 ) -> Result<Tensor, BackendError> {
     if x.shape.last() != Some(&channels) {
         return Err(BackendError::ShapeMismatch {
@@ -285,24 +310,56 @@ fn causal_depthwise_conv1d_silu(
             got: x.shape.clone(),
         });
     }
+    let state_len = kernel_size - 1;
+    if conv_state.len() != channels * state_len {
+        return Err(BackendError::ShapeMismatch {
+            op: "CausalConv1d",
+            expected: vec![channels, state_len],
+            got: vec![conv_state.len()],
+        });
+    }
     let t = x.shape[0];
     let xs = x.as_f32();
     let ws = weight.as_f32();
     let mut out = vec![0f32; t * channels];
-    for ti in 0..t {
-        for c in 0..channels {
+    // Extended per-channel timeline: [history (K-1) ++ this call's x (T)],
+    // length K-1+T. Tap k of position `ti` (0-indexed within this call)
+    // reads extended index `ti + k` (so the newest tap, k=K-1, lands on
+    // extended index `ti+K-1` — `x[ti]` once `ti >= 0`, history before that).
+    for c in 0..channels {
+        let hist = &conv_state[c * state_len..(c + 1) * state_len];
+        for ti in 0..t {
             let mut acc = 0f32;
-            // Kernel tap k reads input position (ti - (kernel_size-1) + k);
-            // positions before 0 are the implicit left zero-padding.
             for k in 0..kernel_size {
-                let src_t = ti as isize - (kernel_size as isize - 1) + k as isize;
-                if src_t < 0 {
-                    continue;
-                }
-                acc += xs[src_t as usize * channels + c] * ws[c * kernel_size + k];
+                let ext_idx = ti + k; // index into the conceptual [hist ++ x] timeline
+                let v = if ext_idx < state_len {
+                    hist[ext_idx]
+                } else {
+                    xs[(ext_idx - state_len) * channels + c]
+                };
+                acc += v * ws[c * kernel_size + k];
             }
             out[ti * channels + c] = silu(acc);
         }
+    }
+    // Update conv_state to the trailing `state_len` values of the full
+    // extended timeline (length state_len + t) — identical to HF's
+    // `conv_state.copy_(hidden_states_new[:, :, -state_len:])`.
+    for c in 0..channels {
+        let hist = &conv_state[c * state_len..(c + 1) * state_len];
+        // Build the new history by walking the same extended-index space
+        // one more time; state_len is tiny (kernel_size-1, e.g. 3) so a
+        // temporary buffer isn't worth avoiding for clarity.
+        let mut new_hist = vec![0f32; state_len];
+        for (i, slot) in new_hist.iter_mut().enumerate() {
+            let ext_idx = t + i; // trailing state_len of [hist ++ x] (length state_len+t)
+            *slot = if ext_idx < state_len {
+                hist[ext_idx]
+            } else {
+                xs[(ext_idx - state_len) * channels + c]
+            };
+        }
+        conv_state[c * state_len..(c + 1) * state_len].copy_from_slice(&new_hist);
     }
     Ok(Tensor::from_f32(vec![t, channels], out))
 }

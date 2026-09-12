@@ -642,6 +642,28 @@ which this layer type does not use at all). This is the practical
 payoff of the 3:1 interleave: 48 of 64 layers carry O(1) memory
 across arbitrarily long context, only 16 carry the usual O(T) KvCache.
 
+**A SECOND piece of cross-call state is easy to miss: the causal
+conv1d's left context.** `state` above covers the delta-rule
+recurrence only. Step 2 (causal depthwise conv) ALSO needs state
+across calls — HF's `cache_params.layers[i].conv_states[0]`
+(`causal_conv1d_update`), `[conv_dim, kernel_size-1]`, oldest-to-newest
+per channel. Without it, a `T=1` decode call (the ONLY shape this
+runtime's decode loop ever actually issues — see `forward.rs`) has no
+way to see the previous `kernel_size-1` tokens' pre-conv values, so
+the conv step implicitly zero-pads as if every token were the first
+one in a brand new sequence. This is wrong for every token after the
+first, silently — no crash, no shape mismatch, and a golden test built
+only around one `T>1` call (this runtime's own first GatedDeltaNet
+golden test, and the reference's own `torch_recurrent_gated_delta_rule`
+signature which takes a whole sequence at once) will not catch it,
+because a single multi-token call never exercises the cross-call path
+at all. `run/backend/cpu/gated_delta.rs::gated_delta_forward`'s
+`conv_state` parameter carries this now; `run/tests/
+gated_delta_conv_state.rs` is the test that actually exercises it — N
+sequential `T=1` calls compared against one real HF `T=N` call, which
+is exactly the equivalence this runtime's decode loop depends on and
+which was silently false before this parameter existed.
+
 Tolerance: same as Sdpa (this is attention's replacement, not a new
 numeric regime) — but verify in f32 given the recurrence's own
 internal f32 requirement above; testing the bf16-storage round-trip
