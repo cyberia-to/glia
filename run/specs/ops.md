@@ -538,6 +538,208 @@ internal f32 requirement above; testing the bf16-storage round-trip
 at the tensor boundary is a separate, additional check, not a
 substitute for it.
 
+### VisionTower (Qwen3.5/3.8 native VL — patch embed through merger)
+
+The "naive dynamic resolution" vision encoder: variable image sizes,
+no fixed input resolution, packed multi-image batches. Verified
+against `transformers.models.qwen3_5.modeling_qwen3_5`
+(`Qwen3_5VisionModel`/`Block`/`Attention`/`PatchEmbed`/`PatchMerger`)
+plus the shared `transformers/vision_utils.py` helpers — 2026-09,
+transformers 5.17.0. Tensor names below use this crate's canonical
+`model.visual.*` prefix (import strips `model.` variance same as the
+text decoder).
+
+**Config** (`[architecture.vision]`, `Qwen3_5VisionConfig` defaults in
+parens): `depth` (27), `hidden_size` (1152), `num_heads` (16),
+`intermediate_size` (4304), `patch_size` (16), `temporal_patch_size`
+(2), `in_channels` (3), `spatial_merge_size` (2),
+`num_position_embeddings` (2304 → `num_grid_per_side = sqrt(this)` =
+48), `out_hidden_size` (5120, matches the LM's `hidden_size` — the
+merger's output feeds straight into the token embedding space),
+`hidden_act` (`gelu_pytorch_tanh`, MLP only — the merger's own
+activation is plain GELU, hardcoded, not config-driven), vision
+`rope_theta` (10000.0, default — NOT necessarily the text decoder's
+own `rope_theta`, separate value). Fusion IDs live on the outer model
+config, not `vision_config`: `image_token_id` (248056),
+`video_token_id` (248057), `vision_start_token_id` (248053),
+`vision_end_token_id` (248054).
+
+**Per-block weights** (`model.visual.blocks.N.*`):
+```
+norm1.{weight,bias}         LayerNorm, NOT RmsNorm — a first in this
+norm2.{weight,bias}         codebase's curated paths, all of which are
+                             RmsNorm elsewhere. eps=1e-6, hardcoded.
+attn.qkv.{weight,bias}      [hidden*3, hidden] — fused QKV, one matmul
+attn.proj.{weight,bias}     [hidden, hidden]
+mlp.linear_fc1.{weight,bias} [intermediate, hidden]
+mlp.linear_fc2.{weight,bias} [hidden, intermediate]
+```
+Non-block weights:
+```
+patch_embed.proj.{weight,bias}   weight declared [hidden, in_channels,
+                                  temporal_patch_size, patch_size, patch_size]
+pos_embed.weight                 [num_position_embeddings, hidden]
+merger.norm.{weight,bias}        LayerNorm(hidden), eps=1e-6
+merger.linear_fc1.{weight,bias}  [hidden*merge², hidden*merge²]
+merger.linear_fc2.{weight,bias}  [out_hidden_size, hidden*merge²]
+```
+
+**1. Patch embed is a matmul, not a sliding convolution.** `Conv3d`
+with `kernel_size == stride == [temporal_patch_size, patch_size,
+patch_size]` and no padding degenerates to: flatten the weight to
+`[hidden, in_channels*temporal_patch_size*patch_size*patch_size]`
+(1536 for the defaults above) and do ONE `y = x @ W^T + b` per patch —
+there is no overlap between patches to convolve across. The image
+preprocessor (`Qwen2VLImageProcessorFast.patchify`, HF-side, not this
+runtime's concern until image ingestion is built) already delivers
+`hidden_states: [num_patches, 1536]` in exactly this flattened
+`[C, T, patch_h, patch_w]` row order — this op is the same reshape
+inverted back to `[hidden]` per patch, i.e. nothing to invert, just
+the matmul.
+
+**2. Learned position embeddings, per-image bilinear-resampled —
+this is the part with no existing analogue in this codebase.**
+`pos_embed.weight` is a square `num_grid_per_side × num_grid_per_side`
+(48×48) learned table. Every image's actual `(h, w)` patch grid gets
+its own per-patch 4-tap bilinear gather+weighted-sum from that ONE
+table (never resized as an image; resampled as a lookup):
+```
+GatherPosEmbed(grid_thw, table[num_grid_per_side², hidden]):
+  # One (row, col) patch position per output token, in BLOCK-MAJOR
+  # order (spatial_merge_size × spatial_merge_size blocks raster-
+  # scanned first, so token order matches Merger's later grouping —
+  # see PatchOrder below; this is NOT plain raster order).
+  side = num_grid_per_side
+  for each patch at grid position (row, col) in image of size (h, w):
+    # align_corners=True closed form of linspace(0, side-1, h)[row]:
+    src_h = row * (side - 1) / max(h - 1, 1)
+    src_w = col * (side - 1) / max(w - 1, 1)
+    h_floor = floor(src_h); w_floor = floor(src_w)
+    # taps (gather indices, clamped) vs weights (from the UNCLAMPED
+    # offset) — see the precise weight rule right below.
+    h_taps = [clamp(h_floor, 0, side-1), clamp(h_floor+1, 0, side-1)]
+    w_taps = [clamp(w_floor, 0, side-1), clamp(w_floor+1, 0, side-1)]
+    # 4 taps, 2D-separable outer product of the two 2-tap axes:
+    out[row,col] = sum over (hi in h_taps, wi in w_taps) of
+                   table[hi*side + wi] * weight(src_h, h_floor+offset_of(hi))
+                                        * weight(src_w, w_floor+offset_of(wi))
+```
+**Weight formula, precisely** (the pseudocode above simplifies the
+index arithmetic; this is the exact rule): for axis value `src` and
+integer taps `t ∈ {floor(src), floor(src)+1}` (each clamped
+independently to `[0, side-1]` for the GATHER index, but the WEIGHT
+uses the **unclamped** `t` so a tap that lands off the edge gets
+correctly small/zero weight rather than double-counting the border):
+`weight(t) = max(1 - |src - t|, 0)`. Two taps per axis always sum to
+1 except when both clamp to the same border index (src outside
+`[0, side-1]`, only possible on a source narrower than the table,
+which cannot happen here since `side=48 ≥` any realistic grid — the
+model was trained at grids ≤48, this is a real but currently
+theoretical edge case).
+`max(h-1, 1)` in the `src_h` formula only matters for a 1-row image
+(division by zero guard) — not reachable from a real photo, matters
+for degenerate test inputs.
+
+**3. Vision RoPE — axial 2D, doubled, NOT the text decoder's RoPE.**
+```
+VisionRotary(head_dim, rope_theta, row, col):
+  spatial_dim = head_dim / 2                    # 36 for head_dim=72
+  inv_freq[i] = 1 / rope_theta^(2i / spatial_dim)   for i in 0..spatial_dim step 2
+                                                  # spatial_dim/2 = 18 values
+  freq_h = row * inv_freq                        # 18 values
+  freq_w = col * inv_freq                        # 18 values
+  freq_hw = concat(freq_h, freq_w)                # 36 values = head_dim/2
+  full = concat(freq_hw, freq_hw)                 # 72 values = head_dim
+  cos = cos(full); sin = sin(full)                # attention_scaling = 1.0, no-op
+  return cos, sin                                 # both length head_dim
+```
+Applied via the SAME `rotate_half` + `q*cos + rotate_half(q)*sin` as
+the text decoder's RoPE (ops.md §3) — only the angle construction
+differs (axial H/W instead of a single running position index), the
+apply step is identical. `row`/`col` here are the SAME block-major
+`(row, col)` pair used for position-embedding interpolation above —
+one position per patch, shared by both mechanisms.
+
+**4. Packed variable-length attention — no causal mask, segmented,
+not windowed.** Each image (or each frame of a video, per-frame) is
+its OWN attention segment: full bidirectional Sdpa within a segment,
+ZERO attention across segment boundaries, computed from cumulative
+patch counts (`cu_seqlens`, one boundary per image/frame — this
+crate's `KvCache`/`SdpaWindow` machinery does not apply, this is
+closer to `SdpaWindow`'s "reshape into blocks" idea except blocks are
+ragged, not fixed-size). `num_heads`=16, `head_dim`=72 (=1152/16),
+scale = `head_dim^-0.5`. No GQA — `num_key_value_heads == num_heads`
+here.
+
+**5. Patch merger — spatial regrouping, then a small MLP, into the
+LM's embedding space.** Input tokens arrive ALREADY in block-major
+order (patch_embed/pos_embed/attention all operate on that same
+token order — see the PatchOrder note below), so merging is just a
+reshape, not a gather: every consecutive run of `spatial_merge_size²`
+(4) tokens is one merge group. **LayerNorm runs PER-PATCH, BEFORE the
+reshape** — `use_postshuffle_norm=False` in the reference means
+`merger.norm` normalizes over `hidden` (1152 features, matching its
+declared `[hidden]` weight/bias shape above), one row at a time; only
+the two Linears afterward operate on the merged `hidden*merge²` width.
+Getting this order backwards (normalize after reshaping to 4608) is a
+shape-compatible but numerically wrong trap — `merger.norm.weight` is
+only 1152 long, so it would need reshaping/broadcasting to even run,
+which is the tell.
+```
+Merger(x[N, hidden], merge=2):
+  normed = LayerNorm(x, eps=1e-6)                     # PER-PATCH, weight/bias [1152]
+  grouped = normed.reshape(N / merge², hidden * merge²)  # [1152*4]=[4608]
+  h = GELU(grouped @ linear_fc1.W^T + linear_fc1.b)   # plain GELU, erf-based —
+                                                        # NOT gelu_pytorch_tanh
+  out = h @ linear_fc2.W^T + linear_fc2.b             # [out_hidden_size]=[5120]
+  return out                                          # one row per merge group
+```
+Output row count is `input_patches / spatial_merge_size²` — this is
+where the image's token count actually shrinks; everything before
+this point (patch_embed, pos_embed, RoPE, attention blocks) operates
+at the FULL per-patch resolution.
+
+**PatchOrder — the block-major convention every stage above shares.**
+Neither raster order nor a fixed tile size: for an image with grid
+`(h, w)` and merge size `m`, token index `k` (before merge) decodes to
+`(row, col)` via
+```
+blocks_w = w / m
+in_col = k % m;  in_row = (k / m) % m
+block_col = (k / (m*m)) % blocks_w;  block_row = k / (m*m*blocks_w)
+row = block_row*m + in_row;  col = block_col*m + in_col
+```
+i.e. the sequence is laid out as `m×m` contiguous blocks, block-raster
+across the image — the SAME order the image preprocessor's `patchify`
+already produces on the host side (`vision_utils.py`'s
+`get_vision_interpolation_indices_and_weights`/`get_vision_position_ids`
+compute position pairs in this order to MATCH the input tokens, not
+to reorder them). The merger above relies on this: reshaping
+consecutive runs of `m²` tokens is only correct because those `m²`
+tokens are already one merge block, not m² scattered raster patches.
+
+**Fusion into the text stream** (`image_token_id`=248056 /
+`video_token_id`=248057 on the outer config, not `vision_config`):
+merger output rows replace `image_token_id` placeholder positions in
+the tokenized prompt 1:1, in order — traced far enough to record the
+IDs and the 1:1 replacement contract; the exact splice point in
+`Qwen3_5Model.forward` (interleaving multiple images/videos, position-
+id bookkeeping for the text decoder's own mRoPE) is NOT yet traced.
+
+**Implemented and golden-tested** (`run/backend/cpu/vision.rs`,
+`run/tests/vision_golden.rs`): patch embed, position-embedding
+interpolation, vision RoPE, packed segmented attention, blocks, and
+patch merger — verified against the real
+`transformers.models.qwen3_5.Qwen3_5VisionModel` forward pass on real
+weights (2 of the model's 27 blocks, a synthetic single 4×4-patch
+image) to 2.6e-6 relative error. **Not yet done**: the "Fusion into
+the text stream" splice point above (traced far enough to record IDs
+and the 1:1 replacement contract, not the exact `Qwen3_5Model.forward`
+mechanics), the image preprocessor (`patchify`, resize, normalize —
+turning a real image file into `pixel_values`), and GPU kernels (CPU
+reference only so far). See `run/specs/gated-delta-vl-plan.md`'s VL
+section for status.
+
 ## 6. Convolution
 
 ### Conv1d, Conv2d, Conv3d

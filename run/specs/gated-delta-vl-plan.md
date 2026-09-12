@@ -378,3 +378,43 @@ the tail of an already-long session.
 Real, multi-session work — not a config tweak. Steps 1+3 are small
 (hours). Step 2 (new op + kernel) and step 4 (VL fix) are each their
 own multi-session effort. Do not schedule this as "the next release."
+
+## Progress — 2026-09-12, VisionTower implemented + golden-tested
+
+All 5 primitives scoped above (patch embed, position interpolation,
+vision RoPE, packed attention, patch merger) are now implemented in
+`run/backend/cpu/vision.rs` and verified against the real
+`transformers.models.qwen3_5.Qwen3_5VisionModel` forward pass —
+`run/tests/vision_golden.rs` extracts real `model.visual.*` weights
+(patch_embed, pos_embed, merger, and the first 2 of the model's real
+27 blocks — `run/scripts/dump_vision_golden.py`, `depth=2`
+truncation) and runs a synthetic single 4×4-patch image through both;
+worst abs diff 0.0013 against `max|hf|=511.35` (2.6e-6 relative) —
+pure f32, no quantization on either side, comparable precision to the
+GatedDeltaNet golden test above.
+
+One real bug caught by the golden test (would NOT have been caught by
+a shape check alone): `Qwen3_5VisionPatchMerger.forward` runs LayerNorm
+PER-PATCH (over `hidden`=1152 features) BEFORE reshaping 4 patches into
+one merge group — I initially implemented it the other way (reshape
+then normalize over 4608), which is shape-INCOMPATIBLE with the real
+`merger.norm.weight`'s actual width (1152), so it failed loudly
+(index-out-of-bounds) rather than silently producing wrong numbers.
+Fixed in both `vision.rs` and the `ops.md` §5 pseudocode (was wrong in
+the spec too — written before this was checked against source this
+carefully).
+
+Still open, per ops.md's "Not yet done" note:
+- **Fusion into the text stream**: `image_token_id` placeholder
+  replacement + multi-image/video position-id bookkeeping in
+  `Qwen3_5Model.forward` — IDs and the 1:1 replacement contract are
+  recorded, exact splice mechanics are not traced.
+- **Image preprocessor**: turning a real image file into
+  `pixel_values` + `grid_thw` (resize, normalize, patchify) — the
+  golden test above uses synthetic-but-correctly-shaped patches, not
+  a real decoded image.
+- **GPU kernels**: CPU reference only, matching GatedDeltaNet's
+  current state — deferred by design, not started.
+- **Memory ceiling for the full 27B model**: EXPLICITLY DEFERRED by
+  the user to a future dedicated "night session when nothing else is
+  running on the machine" — not attempted again this session.

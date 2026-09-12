@@ -20,6 +20,7 @@ mod activation;
 pub mod gated_delta;
 pub mod quant;
 pub mod quant_matmul;
+pub mod vision;
 
 pub use matmul::matmul_f32;
 pub use rmsnorm::rms_norm_f32;
