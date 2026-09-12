@@ -17,6 +17,7 @@
 //! Spec: specs/ops.md §5 "GatedDeltaNet".
 
 use run::backend::cpu::gated_delta::{gated_delta_forward, GatedDeltaDims, GatedDeltaWeights};
+use run::backend::cpu::CpuBackend;
 use run::core::tensor::Tensor;
 use std::path::{Path, PathBuf};
 
@@ -110,7 +111,8 @@ fn gated_delta_matches_hf_reference_on_real_weights() {
     // by conv_state's addition (see run/tests/gated_delta_conv_state.rs
     // for the cross-call-history behavior conv_state actually exists for).
     let mut conv_state = vec![0f32; conv_shape[0] * (dims.conv_kernel_size - 1)];
-    let ours = gated_delta_forward(&x, &weights, dims, 1e-6, &mut state, &mut conv_state).expect("forward");
+    let cpu_backend = CpuBackend::new();
+    let ours = gated_delta_forward(&x, &weights, dims, 1e-6, &mut state, &mut conv_state, &cpu_backend).expect("forward");
     let (hf_shape, hf_data) = read_dump(&PathBuf::from(DIR).join("output.bin"));
     assert_eq!(ours.shape, hf_shape, "output shape mismatch");
 

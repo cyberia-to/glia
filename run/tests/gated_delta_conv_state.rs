@@ -17,6 +17,7 @@
 //! Spec: specs/ops.md §5 "GatedDeltaNet".
 
 use run::backend::cpu::gated_delta::{gated_delta_forward, GatedDeltaDims, GatedDeltaWeights};
+use run::backend::cpu::CpuBackend;
 use run::core::tensor::Tensor;
 use std::path::{Path, PathBuf};
 
@@ -97,10 +98,11 @@ fn sequential_t1_calls_match_one_t6_call() {
 
     // T separate single-token calls, chaining state+conv_state — exactly
     // how forward.rs's decode loop calls this (one token per forward()).
+    let cpu_backend = CpuBackend::new();
     let mut sequential_out = vec![0f32; t * hidden];
     for ti in 0..t {
         let row = Tensor::from_f32(vec![1, hidden], in_data[ti * hidden..(ti + 1) * hidden].to_vec());
-        let out = gated_delta_forward(&row, &weights, dims, 1e-6, &mut state, &mut conv_state).expect("forward");
+        let out = gated_delta_forward(&row, &weights, dims, 1e-6, &mut state, &mut conv_state, &cpu_backend).expect("forward");
         sequential_out[ti * hidden..(ti + 1) * hidden].copy_from_slice(out.as_f32());
     }
 

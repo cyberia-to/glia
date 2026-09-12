@@ -75,6 +75,15 @@ impl GatedDeltaDims {
 /// 2026-09-12) makes every decode step after the first treat itself as
 /// the start of a brand new sequence for the conv1d step specifically —
 /// wrong output, no crash, no shape mismatch to catch it.
+/// `backend`: dispatches the per-token recurrence step through
+/// `Backend::gated_delta_recurrence_step` — CPU backends run it
+/// in-process, honeycrisp runs the real Metal kernel (`run/backend/
+/// honeycrisp/kernels/gated_delta.rs`, verified in isolation against
+/// this same CPU math in `run/tests/gated_delta_honeycrisp.rs`). This
+/// is the one step in the whole layer that can't be a plain matmul —
+/// everything else (the 4 projections, conv1d, gates, RmsNormGated,
+/// out_proj) stays on host f32 regardless of backend, matching this
+/// crate's existing CPU-reference-first precedent for this layer type.
 pub fn gated_delta_forward(
     x: &Tensor,
     w: &GatedDeltaWeights,
@@ -82,6 +91,7 @@ pub fn gated_delta_forward(
     eps: f32,
     state: &mut [f32],
     conv_state: &mut [f32],
+    backend: &dyn crate::backend::Backend,
 ) -> Result<Tensor, BackendError> {
     if x.rank() != 2 {
         return Err(BackendError::ShapeMismatch {
@@ -182,16 +192,17 @@ pub fn gated_delta_forward(
     }
     let mut out = vec![0f32; t * h * hv]; // [T, num_v_heads, head_v_dim], pre out_proj
     for ti in 0..t {
-        for hi in 0..h {
-            let st = &mut state[hi * hk * hv..(hi + 1) * hk * hv];
-            let q_t = &query_h[(ti * h + hi) * hk..(ti * h + hi + 1) * hk];
-            let k_t = &key_h[(ti * h + hi) * hk..(ti * h + hi + 1) * hk];
-            let v_t = &value[ti * vd + hi * hv..ti * vd + (hi + 1) * hv];
-            let decay_t = g[ti * h + hi].exp();
-            let beta_t = beta[ti * h + hi];
-            let out_row = &mut out[(ti * h + hi) * hv..(ti * h + hi + 1) * hv];
-            recurrence_step(st, q_t, k_t, v_t, decay_t, beta_t, hk, hv, out_row);
-        }
+        // One call per TOKEN, batched over all `h` heads — matches
+        // `Backend::gated_delta_recurrence_step`'s contract exactly
+        // (it's the per-head loop lifted into the trait method so a
+        // GPU backend can parallelize across heads in one dispatch).
+        let q_t = &query_h[ti * h * hk..(ti + 1) * h * hk];
+        let k_t = &key_h[ti * h * hk..(ti + 1) * h * hk];
+        let v_t = &value[ti * vd..(ti + 1) * vd];
+        let decay_t: Vec<f32> = g[ti * h..(ti + 1) * h].iter().map(|v| v.exp()).collect();
+        let beta_t = &beta[ti * h..(ti + 1) * h];
+        let out_t = backend.gated_delta_recurrence_step(state, q_t, k_t, v_t, &decay_t, beta_t, h, hk, hv)?;
+        out[ti * h * hv..(ti + 1) * h * hv].copy_from_slice(&out_t);
     }
 
     // 7. RmsNormGated: normalize (reduction over head_v_dim only), THEN

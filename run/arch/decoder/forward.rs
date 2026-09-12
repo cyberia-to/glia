@@ -234,14 +234,31 @@ impl LlamaModel {
                 layer.post_ffw_norm = Some(backend.to_backend(n)?);
             }
             if upload_quant {
-                layer.q_proj.tensor    = backend.to_backend(&layer.q_proj.tensor)?;
-                layer.q_proj.bytes     = Arc::new(Vec::new());
-                layer.k_proj.tensor    = backend.to_backend(&layer.k_proj.tensor)?;
-                layer.k_proj.bytes     = Arc::new(Vec::new());
-                layer.v_proj.tensor    = backend.to_backend(&layer.v_proj.tensor)?;
-                layer.v_proj.bytes     = Arc::new(Vec::new());
-                layer.o_proj.tensor    = backend.to_backend(&layer.o_proj.tensor)?;
-                layer.o_proj.bytes     = Arc::new(Vec::new());
+                // GatedDeltaNet ("linear_attention") layers carry
+                // zero-size PLACEHOLDER self_attn.* QuantWeights (see
+                // weights.rs's `load_layer` LinearAttn branch — they're
+                // never read, `forward_layer` branches to
+                // `backend::cpu::gated_delta` before touching them).
+                // Uploading a 0-element tensor makes honeycrisp's Metal
+                // buffer allocation fail outright — skip them here,
+                // found via `e2e_multimodal.rs`'s honeycrisp variant.
+                let is_real = |t: &Tensor| t.numel() > 0;
+                if is_real(&layer.q_proj.tensor) {
+                    layer.q_proj.tensor = backend.to_backend(&layer.q_proj.tensor)?;
+                    layer.q_proj.bytes  = Arc::new(Vec::new());
+                }
+                if is_real(&layer.k_proj.tensor) {
+                    layer.k_proj.tensor = backend.to_backend(&layer.k_proj.tensor)?;
+                    layer.k_proj.bytes  = Arc::new(Vec::new());
+                }
+                if is_real(&layer.v_proj.tensor) {
+                    layer.v_proj.tensor = backend.to_backend(&layer.v_proj.tensor)?;
+                    layer.v_proj.bytes  = Arc::new(Vec::new());
+                }
+                if is_real(&layer.o_proj.tensor) {
+                    layer.o_proj.tensor = backend.to_backend(&layer.o_proj.tensor)?;
+                    layer.o_proj.bytes  = Arc::new(Vec::new());
+                }
                 layer.gate_proj.tensor = backend.to_backend(&layer.gate_proj.tensor)?;
                 layer.gate_proj.bytes  = Arc::new(Vec::new());
                 layer.up_proj.tensor   = backend.to_backend(&layer.up_proj.tensor)?;
@@ -744,7 +761,7 @@ fn forward_layer(
             out_proj: &out_proj,
         };
         let gdn_out = crate::backend::cpu::gated_delta::gated_delta_forward(
-            &normed_f32, &weights, dims, eps, state, conv_state,
+            &normed_f32, &weights, dims, eps, state, conv_state, backend,
         )?;
         let h1 = backend.execute(&Op::Add, &[hidden, &gdn_out])?.remove(0);
         acc_attention += t_gdn.elapsed().as_secs_f64() * 1000.0;

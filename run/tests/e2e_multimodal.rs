@@ -61,6 +61,33 @@ fn load(name: &str) -> Tensor {
 
 #[test]
 fn e2e_multimodal_sequential_decode_matches_real_hf_forward() {
+    let backend = CpuBackend::new();
+    run_e2e_check(&backend, "cpu");
+}
+
+/// Same check, on honeycrisp — proves the GatedDeltaNet recurrence's
+/// real Metal kernel (`Backend::gated_delta_recurrence_step`,
+/// `run/backend/honeycrisp/kernels/gated_delta.rs`) is actually
+/// reachable and correct from the LIVE decode path, not just the
+/// isolated synthetic-data check in `gated_delta_honeycrisp.rs`. Same
+/// tolerance as the CPU case — the GPU kernel was already verified to
+/// ~2e-9 against the CPU reference in isolation, so any divergence
+/// here would be a WIRING bug (wrong dims/state threading), not new
+/// numeric error.
+#[test]
+fn e2e_multimodal_sequential_decode_matches_real_hf_forward_honeycrisp() {
+    #[cfg(target_os = "macos")]
+    {
+        match run::backend::honeycrisp::HoneycrispBackend::new() {
+            Ok(backend) => run_e2e_check(&backend, "honeycrisp"),
+            Err(e) => eprintln!("skip: honeycrisp unavailable on this machine: {e}"),
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    eprintln!("skip: honeycrisp is macOS-only");
+}
+
+fn run_e2e_check(backend: &dyn run::backend::Backend, backend_label: &str) {
     if !PathBuf::from(GOLDEN_DIR).join("logits.bin").exists() || !PathBuf::from(MODEL_PATH).exists() {
         eprintln!(
             "skip: no golden dump / tiny model — run:\n\
@@ -84,6 +111,7 @@ fn e2e_multimodal_sequential_decode_matches_real_hf_forward() {
     // tower's own weights via Weights::load, exercising that path too
     // (previously only tested via manual golden-dump loading). ──
     let mut model = LlamaModel::load(Path::new(MODEL_PATH)).expect("load tiny model");
+    model.to_backend(backend).expect("to_backend");
     let pixel_values = load("pixel_values");
     let vc = model.config.vision.expect("model must have a vision config");
     let vw = model.weights.vision.as_ref().expect("model must have loaded vision weights");
@@ -133,7 +161,6 @@ fn e2e_multimodal_sequential_decode_matches_real_hf_forward() {
     let (positions, _next_pos) = mrope_position_ids(&runs, spatial_merge_size);
 
     // ── 3. Sequential decode through the REAL runtime, one token at a time ──
-    let backend = CpuBackend::new();
     let mut image_idx = 0usize;
     let mut ours_logits = vec![0f32; seq_len * (meta["vocab_size"].as_u64().unwrap() as usize)];
     let vocab_size = meta["vocab_size"].as_u64().unwrap() as usize;
@@ -153,7 +180,7 @@ fn e2e_multimodal_sequential_decode_matches_real_hf_forward() {
             None
         };
         let override_ = TokenOverride { embed, position: Some(triple) };
-        let logits = model.forward_ex(token_id, &backend, Some(&override_)).expect("forward_ex");
+        let logits = model.forward_ex(token_id, backend, Some(&override_)).expect("forward_ex");
         ours_logits[pos * vocab_size..(pos + 1) * vocab_size].copy_from_slice(&logits);
     }
     assert_eq!(image_idx, n_image_tokens, "must have consumed every image embedding row");
@@ -176,7 +203,7 @@ fn e2e_multimodal_sequential_decode_matches_real_hf_forward() {
             max_ref = max_ref.max(hf_logits[idx].abs());
         }
     }
-    eprintln!("worst logits abs diff {worst_abs} at seq pos {worst_pos}, max|hf|={max_ref}");
+    eprintln!("[{backend_label}] worst logits abs diff {worst_abs} at seq pos {worst_pos}, max|hf|={max_ref}");
     {
         let n = ours_logits.len() as f32;
         let mean_abs_err: f32 = ours_logits.iter().zip(hf_logits.iter()).map(|(o, h)| (o - h).abs()).sum::<f32>() / n;
