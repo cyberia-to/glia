@@ -34,6 +34,9 @@ pollster = "0.4"
 # file loading
 memmap2 = "0.9"
 
+# image decode (PNG/JPEG/WebP/... -> raw RGB) for the vision-tower preprocessor
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif", "bmp"] }
+
 # Apple Silicon turbo backend (macOS only)
 [target.'cfg(target_os = "macos")'.dependencies]
 aruminium = { path = "../../honeycrisp/aruminium" }
@@ -92,6 +95,10 @@ path = "tests/gated_delta_honeycrisp.rs"
 [[test]]
 name = "e2e_multimodal"
 path = "tests/e2e_multimodal.rs"
+
+[[test]]
+name = "vision_preprocess_golden"
+path = "tests/vision_preprocess_golden.rs"
 
 [[test]]
 name = "tier4_ir_exec"
