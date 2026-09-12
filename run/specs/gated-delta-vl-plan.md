@@ -683,9 +683,52 @@ threadgroup per head). Explicitly OUT of scope for
 `forward_decode_fused_layers` (the cross-layer batch path) — per that
 function's own existing `is_linear_attn` bail-out and this plan's
 earlier entry, GatedDeltaNet gets its own per-layer dispatch, same as
-CPU. Next step: write the state-update MSL kernel first (smallest,
-most novel piece), verify it against `cpu::gated_delta`'s already-HF-
-verified math on synthetic small tensors (same "test on real hardware
-without the 27B model" trick that worked for mRoPE), then decide
-whether the surrounding matmuls/conv/gates are worth fusing into one
-dispatch or left as separate calls to existing kernels.
+CPU.
+
+**Update, same day — the state-update kernel is done and verified.**
+`Backend::gated_delta_recurrence_step` (CPU default: one
+`recurrence_step` call per head — that function is now extracted out
+of the main T-loop specifically so both paths share the identical
+formula, no drift possible); honeycrisp overrides with
+`kernels::gated_delta` — one thread per `head_v_dim` column, each
+thread owns its column of the `[head_k_dim, head_v_dim]` state matrix
+entirely (row-major, column stride = `head_v_dim`), so the decay →
+kv_mem → rank-1-update → output sequence needs ZERO cross-thread
+synchronization within a head. `run/tests/gated_delta_honeycrisp.rs`
+runs this on real hardware at the 27B model's actual dims (48 heads,
+128×128 state each) for 4 SEQUENTIAL steps (proving cross-dispatch
+state persistence, not just one call) against the CPU reference —
+worst diff ~2e-9. Doesn't need the 27B model itself: the recurrence
+is pure shape-dependent math, no weights involved, so synthetic
+deterministic input genuinely tests the kernel (the surrounding
+weights/projections/gates stay separately verified against real HF
+output elsewhere).
+
+**NOT wired into the live decode path, on purpose.** `forward_layer`'s
+GatedDeltaNet branch still calls the CPU `gated_delta_forward`
+function unconditionally, which does the WHOLE pipeline (4 matmuls,
+conv1d, gates, the recurrence loop, RmsNormGated, out_proj) as one
+CPU unit. Only the recurrence loop itself has a GPU kernel now — the
+surrounding steps are still CPU f32 (the weights arrive as
+already-dequantized host tensors via `forward_layer`'s own `dequant`
+closure). Wiring JUST the recurrence step to GPU while everything
+else stays on CPU would add a GPU dispatch+readback round trip
+(fixed per-call latency) around a small, cheap computation, for no
+demonstrated benefit — quite possibly a net slowdown, and there is no
+way to benchmark that claim either way without the full model loaded
+(the deferred memory ceiling). Making this a real win requires either
+fusing the WHOLE GatedDeltaNet layer into one GPU dispatch (matmuls +
+conv + gates + recurrence + norm, one command buffer — a much bigger
+task, would need GPU-resident quantized weights for this layer type,
+which don't exist yet either) or at minimum a real benchmark once the
+model fits in memory. Left as explicitly unfinished rather than wired
+speculatively — the standard this whole session has tried to hold to.
+
+**Status of "GPU kernels on honeycrisp" as of this entry**: two real,
+hardware-verified pieces exist (mRoPE — wired into the live path;
+GatedDeltaNet's recurrence step — verified standalone, not wired).
+VisionTower has no GPU kernel and isn't even wired into `forward.rs`
+on CPU yet (scoped and golden-tested standalone only). A full-pipeline
+GPU fusion for GatedDeltaNet, and any GPU work for VisionTower, remain
+open — each is its own multi-hour-plus undertaking, not a quick
+follow-on to what's here.
