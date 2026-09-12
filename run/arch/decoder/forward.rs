@@ -342,12 +342,26 @@ impl LlamaModel {
 
         let pos = self.past_seq_len as f32;
         let pos_tensor = Tensor::from_f32(vec![1], vec![pos]);
-        // Multimodal 3D position override — see `TokenOverride`'s doc
-        // comment. Forces the per-layer fallback path below (skips the
-        // fused cross-layer GPU dispatch entirely, same way LinearAttn
-        // layers already do): the fused path only knows the plain
-        // scalar-pos Op::Rope dispatch.
-        let mrope_pos: Option<[f32; 3]> = override_.and_then(|o| o.position);
+        // 3D mRoPE position — see `TokenOverride`'s doc comment for the
+        // explicit-override (multimodal) case. But ANY model that has
+        // `mrope_section` at all (Qwen3.5/3.8) must ALWAYS take this
+        // path, even for plain text with no image in sight: its
+        // `full_attention` layers' partial rotary uses a CONTIGUOUS-
+        // PREFIX index layout (`apply_rope_cos_sin_f32`), not the
+        // interleaved-pairs-across-full-head_dim layout every existing
+        // `Op::Rope` implementation (CPU `rope_f32`, honeycrisp's MSL
+        // rope kernels) was built for (Gemma-4's "proportional" rope
+        // type — see ops.md's "mRoPE, interleaved" note). A plain-text
+        // position collapses to `t=h=w=pos` exactly, which is why this
+        // single flag correctly covers both cases: no explicit
+        // override needed to get correct math, only to get correct
+        // EMBEDDINGS (image tokens still need `TokenOverride.embed`).
+        // Forces the per-layer fallback path below (skips the fused
+        // cross-layer GPU dispatch, which only knows the plain
+        // scalar-pos Op::Rope path) — same precedent as LinearAttn.
+        let mrope_pos: Option<[f32; 3]> = override_
+            .and_then(|o| o.position)
+            .or_else(|| c.mrope_section.map(|_| [pos, pos, pos]));
 
         let debug_layers = std::env::var("RUN_DEBUG_LAYERS").is_ok();
         if debug_layers {
