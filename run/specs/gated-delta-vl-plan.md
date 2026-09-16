@@ -891,3 +891,135 @@ full 27B model at all (explicitly deferred to a dedicated session with
 nothing else running on the machine) — everything above is verified
 via the tiny e2e test model and real HF reference data, never against
 the actual 27B checkpoint end-to-end.
+
+## 2026-09-16 — 27B end-to-end on real hardware: memory ceiling resolved, perf investigation
+
+The deferred memory ceiling is closed. `~/llm/qwen3.8-27b-heretic.model`
+(29.5GB, Q8 canonical) loads and generates coherent, correct text
+through the full curated `LlamaModel` path on `honeycrisp`, on this
+machine's M4 Max / 48GB unified memory: load ~80-90s, peak RSS ~22GB
+(mmap-backed, well under the 48GB ceiling), decode steady-state
+**5.5-5.7 tok/s** (`mr bench`, 30 steps). Chat-template note unrelated
+to any of this: greedy decoding on this abliterated ("heretic")
+checkpoint puts `<|im_end|>` fractionally above `<think>` as the very
+first post-preamble token — forcing `<think>\n` into the assistant
+turn (`--no-chat` + literal prompt) avoids the immediate-EOS collapse;
+this is model-checkpoint calibration, not a glia decoding bug.
+
+**Real bottleneck found and fixed**: `gated_delta_forward`'s "GPU
+fusion does NOT mean here" scope note above was accurate but the
+CPU-reference cost of the 5 GatedDeltaNet projections was far worse
+than "runs on host f32" — `forward_layer`'s `is_linear_attn` branch was
+calling `crate::backend::cpu::quant::try_dequantize_to_f32` on
+`in_proj_qkv/z/b/a` and `out_proj` **from scratch on every single
+token, on every one of the ~48 GatedDeltaNet layers** (3/4 of this
+model's 64 layers), because `to_backend()` never uploaded these
+`QuantWeight`s to the backend at all. Fixed: `to_backend()` now
+uploads `layer.linear_attn.*`'s 5 projections like every other
+quant weight; `gated_delta_forward` gained `proj_matmul()`, dispatching
+through `backend.quant_matmul` for real (GPU-resident) quant weights
+and staying on `matmul_f32` for the golden tests' plain f32 dumps.
+Real-hardware result: **167.7s → 11.8s** for the same 5-token forced
+generation (~14x) — the recurrence-step GPU kernel from the previous
+session was never the bottleneck; the projections re-dequantizing
+themselves every token was.
+
+**Two follow-up hypotheses tested and disproven, worth recording so
+they aren't re-attempted blind**:
+1. *Dispatch fusion*: fusing the 4 input projections into one
+   `backend.quant_matmul_multi` call (one command buffer, one wait,
+   instead of 4) — rigorous `mr bench` A/B showed **no measurable
+   difference** (177.8ms/tok fused vs. 174.2ms/tok sequential, 30-step
+   average, well within noise). Reverted (`proj_matmul4` deleted) —
+   conclusion: decode at this scale is memory-bandwidth-bound, not
+   per-dispatch-overhead-bound, so consolidating dispatches doesn't
+   help. Measured achieved bandwidth: ~29.5GB / 174ms ≈ **170GB/s**,
+   vs. M4 Max's ~546GB/s spec (~31%) — there IS a real gap, just not
+   one dispatch fusion closes.
+2. *Q4_K requant, expecting ~2x from half the bytes*: re-imported via
+   a new `MI_MATMUL_QUANT=q4k` opt-in env var in `import/pipeline.rs`
+   (dequant→`f32_to_q4k`, NOT canonical "q4" — canonical q4 is
+   documented in `import/naming.rs` as gibberish at this hidden size;
+   Q4_K is GGUF's proven per-block-scale+min scheme and already has a
+   real honeycrisp kernel). Produced `qwen3.8-27b-heretic-q4k.model`
+   (15.8GB, exactly half, 508 tensors re-encoded). Output is coherent
+   and correct (Q4_K's calibration held up, unlike naive q4) — but
+   **slower**, not faster: 3.1-3.6 tok/s depending on kernel variant,
+   vs Q8's 5.5-5.7. Root cause found along the way:
+   `Backend::quant_matmul`'s `QuantKind::Q4K` branch was dispatching
+   through `pipe_q4k` (`kernels::q4k_matmul::MSL`, the scalar
+   1-thread-per-row kernel meant only for the generic `execute()`
+   fallback) instead of `pipe_q4k_large` (the real SIMD-parallel
+   kernel, already correctly used by `forward_decode_fused_layers`
+   elsewhere in the same file) — a genuine wiring bug, fixed by adding
+   `kernels::q4k_matmul::dispatch_large` (mirrors `q8_matmul::dispatch`'s
+   launch geometry: `SIMDS_PER_GROUP=16` rows/threadgroup, 512
+   threads/group) and pointing `quant_matmul` at it. Fixing the wiring
+   bug made it **slower still** (3.1 vs 3.6 tok/s) — conclusion: Q4_K
+   decode on this Metal kernel is compute-bound (unpacking 4-bit
+   nibbles + 6-bit packed sub-block scales/mins is more ALU work per
+   output element than Q8's flat int8 dequant), not memory-bound, so
+   halving the bytes read doesn't translate into a speedup on this
+   hardware/kernel combination. **Q8 remains the recommended dtype for
+   this model on honeycrisp** — the wiring fix is still correct and
+   kept (any future, better-optimized Q4_K kernel now has a working
+   dispatch path to land in), but requantizing to Q4_K is not currently
+   a win.
+
+Net: production path is `~/llm/qwen3.8-27b-heretic.model` (Q8) at
+~5.5-5.7 tok/s on honeycrisp. Closing the remaining gap to the ~546GB/s
+bandwidth roofline (or beyond, via genuine compute reduction) needs
+real Metal-level profiling (Xcode Instruments GPU capture) — not
+available in this environment (`xcrun metal`/`xctrace` both absent,
+only Command Line Tools; full Xcode.app is not installed) — so further
+Q8 kernel tuning was not attempted blind past this point.
+
+**Follow-up same day: real GPU-only kernel timing, without Instruments.**
+`aruminium::Commands` already exposes `gpu_start_time`/`gpu_end_time`/
+`gpu_time()` (real `MTLCommandBuffer` GPU timestamps) — unused by any
+existing benchmark. Made `honeycrisp::{device,kernels}` `pub` (were
+private to the backend module) and wrote `run/examples/q8_vs_q4k_bench.rs`,
+which dispatches one isolated kernel call at a time via `Queue::commands()`
++ `submit()`/`wait()`/`gpu_time()` — bypasses the hot-path `Dispatch`
+engine, gets pure GPU compute+memory time with zero CPU-side dispatch
+overhead. Results at this model's real shapes (hidden=5120):
+
+| shape | N | K | Q8 (µs) | Q4K (µs) | Q4K/Q8 |
+|---|---|---|---|---|---|
+| in_proj_qkv (GDN) | 10240 | 5120 | 290.4 | 218.5 | 0.75x |
+| out_proj (GDN) | 5120 | 6144 | 61.5 | 113.1 | 1.84x |
+| ffn gate/up | 14336 | 5120 | 166.4 | 258.0 | 1.55x |
+| ffn down | 5120 | 14336 | 163.5 | 262.7 | 1.61x |
+
+Q8's ffn gate/up kernel moves 74.4MB in 166.4µs ≈ **447GB/s — ~82% of
+the M4 Max's ~546GB/s spec**. This is the important correction to the
+"31% of peak" estimate above: that number was an end-to-end average
+across every op in a token (including small-tensor ops, RmsNorm,
+recurrence), diluted by non-matmul overhead — the actual matmul kernel
+itself is already near-roofline. There is little headroom left in the
+Q8 kernel; a further 2x from "faster matmul" alone is not realistic.
+Q4K is inconsistent — faster on GDN's own biggest projection, ~1.5-1.8x
+slower everywhere else — a real, shape-dependent kernel inefficiency
+(plausibly occupancy/register-pressure related, unconfirmed without
+per-thread GPU counters), not something to chase further without
+Instruments.
+
+**Where the missing time actually is**: added `GDN_STAGE_DEBUG=1`
+instrumentation inside `gated_delta_forward` (samples calls 500-508 to
+skip `HcPipeline`'s one-time lazy-compile JIT cost on first use per
+shape, which otherwise swamps everything — the first 8 calls of a
+process showed 10-12ms for a projection stage that is 290µs of pure
+GPU time). Warm steady-state per GDN layer: proj ~0.75-1.8ms, conv
+~200µs, gates+l2norm ~8µs (negligible), recurrence ~0.5-1.2ms,
+RmsNormGated ~11µs (negligible), out_proj ~0.23-1.0ms. Compare
+out_proj's measured 233-1025µs here against the isolated benchmark's
+61.5µs pure-GPU number for the identical shape: **3-15x overhead that
+isn't kernel compute**. Root cause candidate, not yet fixed: every
+`quant_matmul`/`gated_delta_recurrence_step` dispatch allocates a
+**fresh Metal output buffer** (`dev.alloc(...)`) on every single call,
+instead of reusing a pooled scratch buffer — `fused_norm_quant_matmul_multi`
+already uses `self.take_scratch(...)` for exactly this reason, just
+never applied to GatedDeltaNet's per-projection/per-recurrence-step
+dispatches. Fixing this (buffer pooling for GDN's hot-path allocations)
+is the next concrete, evidence-backed lever toward materially higher
+tok/s — not attempted this session; flagged for the next one.

@@ -16,8 +16,12 @@ use crate::core::tensor::{BackendData, Tensor, TensorData};
 use std::any::Any;
 use std::sync::Arc;
 
-mod device;
-mod kernels;
+/// `pub` (not `mod`) so standalone profiling binaries (`run/examples/`) can
+/// dispatch individual kernels in isolation with real GPU-only timestamp
+/// timing (`Commands::gpu_time()`) — bypassing the hot-path `Dispatch`
+/// engine, which doesn't expose per-dispatch timing by design.
+pub mod device;
+pub mod kernels;
 
 use device::HoneycrispDevice;
 
@@ -1240,8 +1244,16 @@ impl Backend for HoneycrispBackend {
         let w_buf = self.buf_ref(w)?;
 
         let out_buf = match kind {
-            QuantKind::Q4K => kernels::q4k_matmul::dispatch(
-                &self.device, &self.pipe_q4k.0,
+            // `pipe_q4k_large`, not `pipe_q4k`: the latter is the naive
+            // scalar 1-thread-per-row kernel (only correct for the generic
+            // `execute()` fallback path, see its own dispatch site below).
+            // `pipe_q4k_large` is the SIMD-parallel kernel the fused Sdpa
+            // decode path already uses (see `forward_decode_fused_layers`'s
+            // own `pipe_q4k_large` dispatches) — same kernel, same launch
+            // geometry, now also reachable through the generic
+            // `Backend::quant_matmul` trait method GatedDeltaNet calls.
+            QuantKind::Q4K => kernels::q4k_matmul::dispatch_large(
+                &self.device, &self.pipe_q4k_large.0,
                 x_buf.as_buffer(), w_buf.as_buffer(), batch, n as u32, n_blocks as u32,
             )?,
             QuantKind::Q6K => kernels::q6k_matmul::dispatch(

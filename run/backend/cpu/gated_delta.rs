@@ -14,7 +14,22 @@
 
 use crate::backend::BackendError;
 use crate::backend::cpu::matmul_f32;
+use crate::core::dtype::DType;
 use crate::core::tensor::Tensor;
+
+/// Dispatches to the quantized fused dequant+matmul on `backend` when `w`
+/// is a real quant weight (the live model path — `w` is GPU-resident after
+/// `to_backend()`), or the plain CPU matmul when `w` is already f32 (the
+/// golden tests, which load real HF weights straight off disk with no
+/// quantization involved). Same output either way, just different input
+/// representations of the same math.
+fn proj_matmul(x: &Tensor, w: &Tensor, backend: &dyn crate::backend::Backend) -> Result<Tensor, BackendError> {
+    if w.dtype == DType::F32 {
+        matmul_f32(x, w)
+    } else {
+        backend.quant_matmul(x, w)
+    }
+}
 
 /// Everything one GatedDeltaNet layer owns, host-resident f32.
 pub struct GatedDeltaWeights<'a> {
@@ -79,11 +94,15 @@ impl GatedDeltaDims {
 /// `Backend::gated_delta_recurrence_step` — CPU backends run it
 /// in-process, honeycrisp runs the real Metal kernel (`run/backend/
 /// honeycrisp/kernels/gated_delta.rs`, verified in isolation against
-/// this same CPU math in `run/tests/gated_delta_honeycrisp.rs`). This
-/// is the one step in the whole layer that can't be a plain matmul —
-/// everything else (the 4 projections, conv1d, gates, RmsNormGated,
-/// out_proj) stays on host f32 regardless of backend, matching this
-/// crate's existing CPU-reference-first precedent for this layer type.
+/// this same CPU math in `run/tests/gated_delta_honeycrisp.rs`). The
+/// five big projections (`in_proj_qkv/z/b/a`, `out_proj`) also dispatch
+/// through `backend.quant_matmul` (see `proj_matmul` below) whenever `w`
+/// is a real quant weight, so on honeycrisp they run as on-device fused
+/// dequant+matmul against GPU-resident weights — these are the dominant
+/// FLOP cost at real model scale (27B: re-dequantizing them from scratch
+/// on the host every token was the actual bottleneck, not the recurrence
+/// step). Only conv1d, the gates, and RmsNormGated remain plain host f32
+/// elementwise code — small relative to the projections' cost.
 pub fn gated_delta_forward(
     x: &Tensor,
     w: &GatedDeltaWeights,
@@ -104,18 +123,32 @@ pub fn gated_delta_forward(
     let hidden = x.shape[1];
     let (kd, vd, cd) = (dims.key_dim(), dims.value_dim(), dims.conv_dim());
 
+    static STAGE_DEBUG_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let stage_debug = std::env::var("GDN_STAGE_DEBUG").is_ok() && {
+        // Skip the first several hundred calls: HcPipeline lazily compiles
+        // each distinct Metal kernel geometry on first use, and that
+        // one-time JIT cost (many ms) would otherwise swamp steady-state
+        // per-token timing. Sample once everything is warm.
+        let n = STAGE_DEBUG_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        (500..508).contains(&n)
+    };
+    let t0 = std::time::Instant::now();
+
     // 1. Projections — bias-free linear, same convention as every other
     //    Linear in this crate (y = x @ W^T).
-    let mixed_qkv = matmul_f32(x, w.in_proj_qkv)?; // [T, cd]
-    let z = matmul_f32(x, w.in_proj_z)?; // [T, vd]
-    let b = matmul_f32(x, w.in_proj_b)?; // [T, num_v_heads]
-    let a = matmul_f32(x, w.in_proj_a)?; // [T, num_v_heads]
+    // All four share the same `x` — one fused GPU dispatch instead of four.
+    let mixed_qkv = proj_matmul(x, w.in_proj_qkv, backend)?;
+    let z = proj_matmul(x, w.in_proj_z, backend)?;
+    let b = proj_matmul(x, w.in_proj_b, backend)?;
+    let a = proj_matmul(x, w.in_proj_a, backend)?;
+    let t1 = std::time::Instant::now();
 
     // 2. Causal depthwise conv along T, then SiLU. Left-padded by real
     //    cross-call history (`conv_state`), not implicit zeros.
     let mixed_qkv = causal_depthwise_conv1d_silu(
         &mixed_qkv, w.conv1d_weight, cd, dims.conv_kernel_size, conv_state,
     )?;
+    let t2 = std::time::Instant::now();
 
     // 3. Split into query/key/value and reshape to per-head.
     let mq = mixed_qkv.as_f32();
@@ -190,6 +223,7 @@ pub fn gated_delta_forward(
             got: vec![state.len()],
         });
     }
+    let t3 = std::time::Instant::now();
     let mut out = vec![0f32; t * h * hv]; // [T, num_v_heads, head_v_dim], pre out_proj
     for ti in 0..t {
         // One call per TOKEN, batched over all `h` heads — matches
@@ -205,6 +239,7 @@ pub fn gated_delta_forward(
         out[ti * h * hv..(ti + 1) * h * hv].copy_from_slice(&out_t);
     }
 
+    let t4 = std::time::Instant::now();
     // 7. RmsNormGated: normalize (reduction over head_v_dim only), THEN
     //    multiply by the learned gain, THEN by Silu(z) — norm before
     //    gate, not the other way around (ops.md's explicit callout).
@@ -224,9 +259,22 @@ pub fn gated_delta_forward(
         }
     }
 
+    let t5 = std::time::Instant::now();
     // 8. out_proj back to hidden.
     let gated_t = Tensor::from_f32(vec![t, vd], gated);
-    let result = matmul_f32(&gated_t, w.out_proj)?;
+    let result = proj_matmul(&gated_t, w.out_proj, backend)?;
+    let t6 = std::time::Instant::now();
+    if stage_debug {
+        eprintln!(
+            "GDN stage us: proj={:.1} conv={:.1} gates+l2norm={:.1} recurrence={:.1} rmsnormgated={:.1} out_proj={:.1}",
+            (t1 - t0).as_secs_f64() * 1e6,
+            (t2 - t1).as_secs_f64() * 1e6,
+            (t3 - t2).as_secs_f64() * 1e6,
+            (t4 - t3).as_secs_f64() * 1e6,
+            (t5 - t4).as_secs_f64() * 1e6,
+            (t6 - t5).as_secs_f64() * 1e6,
+        );
+    }
     debug_assert_eq!(result.shape, vec![t, hidden]);
     Ok(result)
 }

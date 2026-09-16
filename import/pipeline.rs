@@ -595,7 +595,17 @@ print('\n'.join(lines))
         // - Q6_K / Q5_K / Q3_K / Q2_K source + weight matrix + 256-aligned K →
         //   dequant→f32→re-quantize as Q4K so the whole model is dtype-uniform.
         //   Uniform dtype is required for the fused SIMD decode path.
-        // - Everything else → canonical dequant+re-encode policy.
+        // - MI_MATMUL_QUANT=q4k env override + weight matrix + 256-aligned K →
+        //   dequant→f32→quantize as Q4K regardless of source dtype. Opt-in
+        //   (default canonical policy below is unchanged for everyone else):
+        //   canonical "q4" is documented above `canonical_encoding_for` as
+        //   producing gibberish at hidden=5120+ scale, but GGUF-style Q4_K
+        //   (per-block scale+min, the same scheme llama.cpp ships at every
+        //   model size) is a different, better-calibrated format — already
+        //   has a real honeycrisp Metal kernel (`quant_matmul`'s QuantKind::Q4K)
+        //   and halves the bytes read per token vs. q8, which is what a
+        //   memory-bandwidth-bound decode step actually pays for.
+        let force_q4k = std::env::var("MI_MATMUL_QUANT").map(|v| v == "q4k").unwrap_or(false);
         let is_kquant_weight = crate::naming::canonical_encoding_for(&hf_name) == "q8"
             && w.shape.len() >= 2
             && w.shape[w.shape.len() - 1] % 256 == 0;
@@ -603,12 +613,13 @@ print('\n'.join(lines))
             if w.dtype == crate::DType::Q4_K && is_kquant_weight && w.data.len() % 144 == 0 {
                 // GGUF bytes are already in [N, K] row-major layout (loader reverses dims, not bytes).
                 ("q4k", w.data.clone())
-            } else if matches!(w.dtype,
+            } else if (matches!(w.dtype,
                     crate::DType::Q6_K | crate::DType::Q5_K |
                     crate::DType::Q3_K | crate::DType::Q2_K)
+                || force_q4k)
                 && is_kquant_weight
             {
-                // Re-encode as Q4K for uniform dtype.
+                // Re-encode as Q4K for uniform dtype (or opt-in speed).
                 let f32s = crate::dequantize_to_f32(&w.data, w.dtype);
                 if f32s.is_empty() {
                     eprintln!("warn: {tname} dequant returned empty (dtype {:?})", w.dtype);

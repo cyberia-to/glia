@@ -265,6 +265,24 @@ impl LlamaModel {
                 layer.up_proj.bytes    = Arc::new(Vec::new());
                 layer.down_proj.tensor = backend.to_backend(&layer.down_proj.tensor)?;
                 layer.down_proj.bytes  = Arc::new(Vec::new());
+                // GatedDeltaNet's own five big projections — real quant
+                // weights (unlike the zero-size self_attn.* placeholders
+                // above), so no `is_real` guard needed. Uploading these
+                // is what lets `gated_delta_forward`'s `proj_matmul`
+                // dispatch through `backend.quant_matmul` instead of
+                // re-dequantizing from host bytes on every token.
+                if let Some(ref mut la) = layer.linear_attn {
+                    la.in_proj_qkv.tensor = backend.to_backend(&la.in_proj_qkv.tensor)?;
+                    la.in_proj_qkv.bytes  = Arc::new(Vec::new());
+                    la.in_proj_z.tensor   = backend.to_backend(&la.in_proj_z.tensor)?;
+                    la.in_proj_z.bytes    = Arc::new(Vec::new());
+                    la.in_proj_b.tensor   = backend.to_backend(&la.in_proj_b.tensor)?;
+                    la.in_proj_b.bytes    = Arc::new(Vec::new());
+                    la.in_proj_a.tensor   = backend.to_backend(&la.in_proj_a.tensor)?;
+                    la.in_proj_a.bytes    = Arc::new(Vec::new());
+                    la.out_proj.tensor    = backend.to_backend(&la.out_proj.tensor)?;
+                    la.out_proj.bytes     = Arc::new(Vec::new());
+                }
             }
         }
         Ok(())
@@ -732,7 +750,6 @@ fn forward_layer(
         let normed = backend
             .execute(&Op::RmsNorm { eps }, &[hidden, &layer.input_norm])?
             .remove(0);
-        let normed_f32 = Tensor::from_f32(normed.shape.clone(), backend.download_f32(&normed)?);
         let dims = crate::backend::cpu::gated_delta::GatedDeltaDims {
             num_v_heads: config.linear_num_value_heads.unwrap_or(0),
             num_k_heads: config.linear_num_key_heads.unwrap_or(0),
@@ -740,28 +757,26 @@ fn forward_layer(
             head_v_dim: config.linear_value_head_dim.unwrap_or(0),
             conv_kernel_size: config.linear_conv_kernel_dim.unwrap_or(0),
         };
-        let dequant = |qw: &QuantWeight| -> Result<Tensor, BackendError> {
-            let f32s = crate::backend::cpu::quant::try_dequantize_to_f32(&qw.bytes, qw.dtype)?;
-            Ok(Tensor::from_f32(qw.shape.clone(), f32s))
-        };
-        let in_proj_qkv = dequant(&la.in_proj_qkv)?;
-        let in_proj_z = dequant(&la.in_proj_z)?;
-        let in_proj_b = dequant(&la.in_proj_b)?;
-        let in_proj_a = dequant(&la.in_proj_a)?;
-        let out_proj = dequant(&la.out_proj)?;
+        // `in_proj_*`/`out_proj` are quant weights, GPU-resident after
+        // `to_backend()` — `gated_delta_forward`'s `proj_matmul` dispatches
+        // them through `backend.quant_matmul` directly, no host dequant
+        // here. `normed` likewise passes straight through: on honeycrisp
+        // it's a shared-storage (unified memory) buffer, so any later
+        // `.as_f32()` inside `gated_delta_forward` reads it zero-copy —
+        // no `download_f32` round-trip needed.
         let weights = crate::backend::cpu::gated_delta::GatedDeltaWeights {
-            in_proj_qkv: &in_proj_qkv,
-            in_proj_z: &in_proj_z,
-            in_proj_b: &in_proj_b,
-            in_proj_a: &in_proj_a,
+            in_proj_qkv: &la.in_proj_qkv.tensor,
+            in_proj_z: &la.in_proj_z.tensor,
+            in_proj_b: &la.in_proj_b.tensor,
+            in_proj_a: &la.in_proj_a.tensor,
             conv1d_weight: &la.conv1d_weight,
             a_log: &la.a_log,
             dt_bias: &la.dt_bias,
             norm_weight: &la.norm_weight,
-            out_proj: &out_proj,
+            out_proj: &la.out_proj.tensor,
         };
         let gdn_out = crate::backend::cpu::gated_delta::gated_delta_forward(
-            &normed_f32, &weights, dims, eps, state, conv_state, backend,
+            &normed, &weights, dims, eps, state, conv_state, backend,
         )?;
         let h1 = backend.execute(&Op::Add, &[hidden, &gdn_out])?.remove(0);
         acc_attention += t_gdn.elapsed().as_secs_f64() * 1000.0;
