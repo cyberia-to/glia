@@ -282,6 +282,15 @@ impl LlamaModel {
                     la.in_proj_a.bytes    = Arc::new(Vec::new());
                     la.out_proj.tensor    = backend.to_backend(&la.out_proj.tensor)?;
                     la.out_proj.bytes     = Arc::new(Vec::new());
+                    // The four small f32 tensors too, so the fused block
+                    // borrows them zero-copy instead of re-uploading
+                    // ~260 KB of conv weights per layer per token. The
+                    // per-op path's `.as_f32()` still reads them (shared
+                    // storage).
+                    la.conv1d_weight = backend.to_backend(&la.conv1d_weight)?;
+                    la.a_log         = backend.to_backend(&la.a_log)?;
+                    la.dt_bias       = backend.to_backend(&la.dt_bias)?;
+                    la.norm_weight   = backend.to_backend(&la.norm_weight)?;
                 }
             }
         }
@@ -747,9 +756,6 @@ fn forward_layer(
                 "layer {layer_idx}: linear_attention layer called without a GatedDeltaNet conv_state buffer"
             )));
         };
-        let normed = backend
-            .execute(&Op::RmsNorm { eps }, &[hidden, &layer.input_norm])?
-            .remove(0);
         let dims = crate::backend::cpu::gated_delta::GatedDeltaDims {
             num_v_heads: config.linear_num_value_heads.unwrap_or(0),
             num_k_heads: config.linear_num_key_heads.unwrap_or(0),
@@ -757,28 +763,81 @@ fn forward_layer(
             head_v_dim: config.linear_value_head_dim.unwrap_or(0),
             conv_kernel_size: config.linear_conv_kernel_dim.unwrap_or(0),
         };
-        // `in_proj_*`/`out_proj` are quant weights, GPU-resident after
-        // `to_backend()` — `gated_delta_forward`'s `proj_matmul` dispatches
-        // them through `backend.quant_matmul` directly, no host dequant
-        // here. `normed` likewise passes straight through: on honeycrisp
-        // it's a shared-storage (unified memory) buffer, so any later
-        // `.as_f32()` inside `gated_delta_forward` reads it zero-copy —
-        // no `download_f32` round-trip needed.
-        let weights = crate::backend::cpu::gated_delta::GatedDeltaWeights {
-            in_proj_qkv: &la.in_proj_qkv.tensor,
-            in_proj_z: &la.in_proj_z.tensor,
-            in_proj_b: &la.in_proj_b.tensor,
-            in_proj_a: &la.in_proj_a.tensor,
-            conv1d_weight: &la.conv1d_weight,
-            a_log: &la.a_log,
-            dt_bias: &la.dt_bias,
-            norm_weight: &la.norm_weight,
-            out_proj: &la.out_proj.tensor,
+        // Whole block in one GPU command buffer when the backend can
+        // (honeycrisp, Q8 weights, T=1). GDN_FUSED=0 forces the per-op
+        // path; GDN_FUSED_CHECK=1 runs BOTH and prints the per-layer
+        // divergence — the correctness check for the fused kernels on
+        // real weights.
+        let fused_off = std::env::var("GDN_FUSED").map(|v| v == "0").unwrap_or(false);
+        let fused_check = std::env::var("GDN_FUSED_CHECK").is_ok();
+        let fused_h1 = if fused_off {
+            None
+        } else {
+            let inp = crate::backend::GatedDeltaBlockInput {
+                layer_idx,
+                hidden,
+                input_norm: &layer.input_norm,
+                in_proj_qkv: &la.in_proj_qkv.tensor,
+                in_proj_z: &la.in_proj_z.tensor,
+                in_proj_b: &la.in_proj_b.tensor,
+                in_proj_a: &la.in_proj_a.tensor,
+                out_proj: &la.out_proj.tensor,
+                conv1d_weight: &la.conv1d_weight,
+                a_log: &la.a_log,
+                dt_bias: &la.dt_bias,
+                norm_weight: &la.norm_weight,
+                dims,
+                eps,
+                past_seq_len,
+            };
+            backend.gated_delta_block_fused(&inp, state, conv_state)?
         };
-        let gdn_out = crate::backend::cpu::gated_delta::gated_delta_forward(
-            &normed, &weights, dims, eps, state, conv_state, backend,
-        )?;
-        let h1 = backend.execute(&Op::Add, &[hidden, &gdn_out])?.remove(0);
+        let h1 = match fused_h1 {
+            Some(h1_fused) if !fused_check => h1_fused,
+            fused => {
+                // Per-op path. `in_proj_*`/`out_proj` are quant weights,
+                // GPU-resident after `to_backend()` — `gated_delta_forward`'s
+                // `proj_matmul` dispatches them through `backend.quant_matmul`
+                // directly, no host dequant here. `normed` passes straight
+                // through: on honeycrisp it's a shared-storage buffer, so
+                // `.as_f32()` inside reads it zero-copy.
+                let normed = backend
+                    .execute(&Op::RmsNorm { eps }, &[hidden, &layer.input_norm])?
+                    .remove(0);
+                let weights = crate::backend::cpu::gated_delta::GatedDeltaWeights {
+                    in_proj_qkv: &la.in_proj_qkv.tensor,
+                    in_proj_z: &la.in_proj_z.tensor,
+                    in_proj_b: &la.in_proj_b.tensor,
+                    in_proj_a: &la.in_proj_a.tensor,
+                    conv1d_weight: &la.conv1d_weight,
+                    a_log: &la.a_log,
+                    dt_bias: &la.dt_bias,
+                    norm_weight: &la.norm_weight,
+                    out_proj: &la.out_proj.tensor,
+                };
+                let gdn_out = crate::backend::cpu::gated_delta::gated_delta_forward(
+                    &normed, &weights, dims, eps, state, conv_state, backend,
+                )?;
+                let h1_ref = backend.execute(&Op::Add, &[hidden, &gdn_out])?.remove(0);
+                match fused {
+                    Some(h1_fused) => {
+                        let a = backend.download_f32(&h1_fused)?;
+                        let b = backend.download_f32(&h1_ref)?;
+                        let (mut worst, mut max_ref) = (0f32, 0f32);
+                        for (x, y) in a.iter().zip(b.iter()) {
+                            worst = worst.max((x - y).abs());
+                            max_ref = max_ref.max(y.abs());
+                        }
+                        eprintln!(
+                            "[GDN_FUSED_CHECK] layer {layer_idx:>3} pos {past_seq_len:>4}: worst abs diff {worst:.3e}  max|ref| {max_ref:.3e}  rel {:.3e}",
+                            worst / max_ref.max(1e-12)
+                        );
+                        h1_fused
+                    }
+                    None => h1_ref,
+                }
+            }
+        };
         acc_attention += t_gdn.elapsed().as_secs_f64() * 1000.0;
         h1
     } else {

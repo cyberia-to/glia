@@ -3,6 +3,7 @@
 pub mod attention;
 pub mod elementwise;
 pub mod gated_delta;
+pub mod gated_delta_block;
 pub mod matmul;
 pub mod mrope;
 pub mod q4_matmul;

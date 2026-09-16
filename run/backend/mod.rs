@@ -51,6 +51,34 @@ pub struct LayerFusedInput<'a> {
     pub layer_output_scale: f32,
 }
 
+/// Inputs for `gated_delta_block_fused` — one GatedDeltaNet attention block
+/// (`linear_attention` layer, Qwen3.5/3.8) for ONE decode token.
+/// Projection weights are quant tensors, GPU-resident after `to_backend()`;
+/// the small f32 tensors may be host- or GPU-resident.
+pub struct GatedDeltaBlockInput<'a> {
+    pub layer_idx: usize,
+    /// `[1, hidden]` f32 — the residual stream entering the layer.
+    pub hidden: &'a Tensor,
+    /// `[hidden]` f32 — input_layernorm gain (already `+1`-folded at load
+    /// for zero-centered families).
+    pub input_norm: &'a Tensor,
+    pub in_proj_qkv: &'a Tensor, // [conv_dim, hidden]
+    pub in_proj_z: &'a Tensor,   // [value_dim, hidden]
+    pub in_proj_b: &'a Tensor,   // [num_v_heads, hidden]
+    pub in_proj_a: &'a Tensor,   // [num_v_heads, hidden]
+    pub out_proj: &'a Tensor,    // [hidden, value_dim]
+    pub conv1d_weight: &'a Tensor, // [conv_dim, kernel_size] f32
+    pub a_log: &'a Tensor,       // [num_v_heads] f32
+    pub dt_bias: &'a Tensor,     // [num_v_heads] f32
+    pub norm_weight: &'a Tensor, // [head_v_dim] f32
+    pub dims: crate::backend::cpu::gated_delta::GatedDeltaDims,
+    pub eps: f32,
+    /// Tokens already processed in this sequence. `0` marks a fresh
+    /// sequence: the backend re-seeds its persistent state from the host
+    /// slices then; afterwards the backend's own copy is the live one.
+    pub past_seq_len: usize,
+}
+
 /// Three backends + cpu reference library.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BackendKind {
@@ -318,6 +346,31 @@ pub trait Backend: Send + Sync {
     /// Fused FFN block: post_norm + gate + up + silu*up + down + residual_add.
     /// Returns hidden_in + down_proj(silu(gate(norm(hidden_in))) * up(...)).
     /// Default = composition of per-op calls.
+    /// Whole GatedDeltaNet attention block for one decode token, returning
+    /// `hidden + gdn_out` (the residual sum that feeds the FFN):
+    /// RmsNorm → 4 projections → causal conv1d+SiLU (persistent conv_state)
+    /// → gates / L2-norm / head-expand → delta-rule recurrence (persistent
+    /// state) → RmsNormGated·SiLU(z) → out_proj + residual. A GPU backend
+    /// encodes all of it into ONE command buffer (one submit, one wait) and
+    /// keeps `state`/`conv_state` resident on the device — the per-op path
+    /// pays ~9 synchronous round-trips plus a full state upload+readback per
+    /// layer per token for the same math.
+    ///
+    /// State contract: `state` and `conv_state` (host) are read only when
+    /// `inp.past_seq_len == 0`; they are NOT written back per token. A
+    /// backend that can't run the block fused for these inputs returns
+    /// `Ok(None)` and the caller uses the per-op path (which does keep the
+    /// host slices current). Default: `None`.
+    fn gated_delta_block_fused(
+        &self,
+        inp: &GatedDeltaBlockInput<'_>,
+        state: &mut [f32],
+        conv_state: &mut [f32],
+    ) -> Result<Option<Tensor>, BackendError> {
+        let _ = (inp, state, conv_state);
+        Ok(None)
+    }
+
     fn fused_ffn_residual(
         &self,
         hidden_in: &Tensor,

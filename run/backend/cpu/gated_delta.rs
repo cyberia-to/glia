@@ -54,13 +54,13 @@ pub struct GatedDeltaDims {
 }
 
 impl GatedDeltaDims {
-    fn key_dim(&self) -> usize {
+    pub fn key_dim(&self) -> usize {
         self.num_k_heads * self.head_k_dim
     }
-    fn value_dim(&self) -> usize {
+    pub fn value_dim(&self) -> usize {
         self.num_v_heads * self.head_v_dim
     }
-    fn conv_dim(&self) -> usize {
+    pub fn conv_dim(&self) -> usize {
         self.key_dim() * 2 + self.value_dim()
     }
 }

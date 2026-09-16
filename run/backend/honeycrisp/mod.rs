@@ -37,6 +37,31 @@ struct HcBuffer {
 struct PooledBuf(aruminium::Buffer);
 unsafe impl Send for PooledBuf {}
 
+/// Per-layer GPU-resident GatedDeltaNet state for `gated_delta_block_fused`:
+/// the `[num_v_heads, head_k_dim, head_v_dim]` delta-rule state and the
+/// `[conv_dim, kernel_size-1]` conv1d history. Seeded from the host slices
+/// at `past_seq_len == 0`, then read-modify-written on the GPU every token
+/// without any host round-trip (the per-op `gated_delta_recurrence_step`
+/// uploads and reads back the full state — ~3 MB each way — every call).
+struct GdnLayerGpu {
+    state: aruminium::Buffer,
+    conv_state: aruminium::Buffer,
+}
+unsafe impl Send for GdnLayerGpu {}
+unsafe impl Sync for GdnLayerGpu {}
+
+/// The three geometry-specialized kernels of the fused GatedDeltaNet block
+/// (see `kernels::gated_delta_block`), cached per geometry.
+struct GdnBlockPipes {
+    hk: usize,
+    hv: usize,
+    ratio: usize,
+    ksz: usize,
+    conv: HcPipeline,
+    prep: HcPipeline,
+    gnorm: HcPipeline,
+}
+
 /// GPU KV cache + attention pipelines, lazily constructed for a specific
 /// (num_heads, kv_heads, head_dim, max_seq) tuple — needed because the
 /// attention kernel bakes those as MSL constants (avoids the rope-style
@@ -243,6 +268,10 @@ pub struct HoneycrispBackend {
     /// Lazily-built GatedDeltaNet recurrence-step pipelines, keyed by
     /// (head_k_dim, head_v_dim).
     gdn_pipes: std::sync::Mutex<Vec<(usize, usize, HcPipeline)>>,
+    /// Fused-block kernels per (head_k_dim, head_v_dim, ratio, kernel_size).
+    gdn_block_pipes: std::sync::Mutex<Vec<GdnBlockPipes>>,
+    /// Persistent GPU state per GatedDeltaNet layer_idx (fused block only).
+    gdn_gpu_state: std::sync::Mutex<std::collections::HashMap<usize, GdnLayerGpu>>,
 }
 
 struct TransposedCache(std::collections::HashMap<usize, Box<aruminium::Buffer>>);
@@ -419,6 +448,8 @@ impl HoneycrispBackend {
             transposed_down_w: std::sync::Mutex::new(TransposedCache(std::collections::HashMap::new())),
             mrope_pipes: std::sync::Mutex::new(Vec::new()),
             gdn_pipes: std::sync::Mutex::new(Vec::new()),
+            gdn_block_pipes: std::sync::Mutex::new(Vec::new()),
+            gdn_gpu_state: std::sync::Mutex::new(std::collections::HashMap::new()),
         })
     }
 
@@ -444,6 +475,27 @@ impl HoneycrispBackend {
         let msl = kernels::gated_delta::msl_for(head_k_dim, head_v_dim);
         let pipe = HcPipeline(self.device.pipeline(&msl)?);
         guard.push((head_k_dim, head_v_dim, pipe));
+        Ok(())
+    }
+
+    /// Lazily compile the fused GatedDeltaNet block's three small kernels
+    /// for this geometry (cached; same pattern as `gdn_pipeline`).
+    fn gdn_block_pipeline(
+        &self,
+        hk: usize,
+        hv: usize,
+        ratio: usize,
+        ksz: usize,
+    ) -> Result<(), BackendError> {
+        let mut guard = self.gdn_block_pipes.lock().unwrap();
+        if guard.iter().any(|p| p.hk == hk && p.hv == hv && p.ratio == ratio && p.ksz == ksz) {
+            return Ok(());
+        }
+        use kernels::gated_delta_block as gb;
+        let conv = HcPipeline(self.device.pipeline(&gb::msl_conv_silu(ksz))?);
+        let prep = HcPipeline(self.device.pipeline(&gb::msl_prep(hk, ratio))?);
+        let gnorm = HcPipeline(self.device.pipeline(&gb::msl_gated_norm(hv))?);
+        guard.push(GdnBlockPipes { hk, hv, ratio, ksz, conv, prep, gnorm });
         Ok(())
     }
 
@@ -1039,6 +1091,238 @@ impl Backend for HoneycrispBackend {
             n_rows, head_dim as u32,
         )?;
         Ok(self.wrap_output(out_buf, x.shape.clone(), DType::F32))
+    }
+
+    fn gated_delta_block_fused(
+        &self,
+        inp: &crate::backend::GatedDeltaBlockInput<'_>,
+        state: &mut [f32],
+        conv_state: &mut [f32],
+    ) -> Result<Option<Tensor>, BackendError> {
+        const OP: &str = "gated_delta_block_fused";
+        let d = inp.dims;
+        let (h, hk, hv, ksz) = (d.num_v_heads, d.head_k_dim, d.head_v_dim, d.conv_kernel_size);
+        if d.num_k_heads == 0 || h == 0 || h % d.num_k_heads != 0 {
+            return Ok(None);
+        }
+        let ratio = h / d.num_k_heads;
+        let (kd, vd, cd) = (d.key_dim(), d.value_dim(), d.conv_dim());
+        // Decode only (T=1); prefill still goes one token per call in this
+        // crate, so this covers every real call.
+        if inp.hidden.rank() != 2 || inp.hidden.shape[0] != 1 || inp.hidden.dtype != DType::F32 {
+            return Ok(None);
+        }
+        let hidden_dim = inp.hidden.shape[1];
+        // Kernel constraints — see kernels/gated_delta_block.rs header. Q8
+        // matmul kernels need K % 32 == 0. v is read straight out of the
+        // conv output at float offset 2*kd, a Metal buffer offset that must
+        // be 256-byte aligned.
+        if ksz < 2 || hk % 32 != 0 || hv % 32 != 0 || hk > 1024 || hv > 1024 {
+            return Ok(None);
+        }
+        if hidden_dim % 32 != 0 || vd % 32 != 0 || (2 * kd * 4) % 256 != 0 {
+            return Ok(None);
+        }
+        let ws = [inp.in_proj_qkv, inp.in_proj_z, inp.in_proj_b, inp.in_proj_a, inp.out_proj];
+        let on_gpu_q8 = |w: &Tensor| {
+            w.dtype == DType::Q8 && w.rank() == 2 && matches!(w.data, TensorData::Backend(_))
+        };
+        if !ws.iter().all(|w| on_gpu_q8(w)) {
+            return Ok(None);
+        }
+        let expect = [[cd, hidden_dim], [vd, hidden_dim], [h, hidden_dim], [h, hidden_dim], [hidden_dim, vd]];
+        for (w, e) in ws.iter().zip(expect.iter()) {
+            if w.shape[0] != e[0] || w.shape[1] != e[1] {
+                return Err(BackendError::ShapeMismatch {
+                    op: OP, expected: e.to_vec(), got: w.shape.clone(),
+                });
+            }
+        }
+        for (t, n) in [
+            (inp.input_norm, hidden_dim),
+            (inp.conv1d_weight, cd * ksz),
+            (inp.a_log, h),
+            (inp.dt_bias, h),
+            (inp.norm_weight, hv),
+        ] {
+            if t.dtype != DType::F32 || t.numel() != n {
+                return Err(BackendError::ShapeMismatch {
+                    op: OP, expected: vec![n], got: t.shape.clone(),
+                });
+            }
+        }
+        if state.len() != h * hk * hv {
+            return Err(BackendError::ShapeMismatch {
+                op: OP, expected: vec![h, hk, hv], got: vec![state.len()],
+            });
+        }
+        if conv_state.len() != cd * (ksz - 1) {
+            return Err(BackendError::ShapeMismatch {
+                op: OP, expected: vec![cd, ksz - 1], got: vec![conv_state.len()],
+            });
+        }
+
+        self.gdn_pipeline(hk, hv)?;
+        self.gdn_block_pipeline(hk, hv, ratio, ksz)?;
+        let rec_guard = self.gdn_pipes.lock().unwrap();
+        let (_, _, pipe_rec) = rec_guard
+            .iter()
+            .find(|(a, b, _)| *a == hk && *b == hv)
+            .expect("gdn_pipeline just inserted this geometry");
+        let blk_guard = self.gdn_block_pipes.lock().unwrap();
+        let bp = blk_guard
+            .iter()
+            .find(|p| p.hk == hk && p.hv == hv && p.ratio == ratio && p.ksz == ksz)
+            .expect("gdn_block_pipeline just inserted this geometry");
+
+        // Persistent per-layer state: seed from the host slices at the start
+        // of a sequence, then the GPU copy is the live one.
+        let mut gs = self.gdn_gpu_state.lock().unwrap();
+        if inp.past_seq_len == 0 || !gs.contains_key(&inp.layer_idx) {
+            let st = self.device.gpu.buffer_with_data(bytemuck::cast_slice(state))
+                .map_err(|e| BackendError::Internal(format!("gdn state seed: {e}")))?;
+            let cs = self.device.gpu.buffer_with_data(bytemuck::cast_slice(conv_state))
+                .map_err(|e| BackendError::Internal(format!("gdn conv_state seed: {e}")))?;
+            gs.insert(inp.layer_idx, GdnLayerGpu { state: st, conv_state: cs });
+        }
+        let layer = gs.get(&inp.layer_idx).expect("inserted above");
+
+        let x_buf = self.buf_ref(inp.hidden)?;
+        let gamma = self.buf_ref(inp.input_norm)?;
+        let conv_w = self.buf_ref(inp.conv1d_weight)?;
+        let a_log = self.buf_ref(inp.a_log)?;
+        let dt_bias = self.buf_ref(inp.dt_bias)?;
+        let norm_w = self.buf_ref(inp.norm_weight)?;
+        let w_bufs = ws.iter().map(|w| self.buf_ref(w)).collect::<Result<Vec<_>, _>>()?;
+
+        let fb = |n: usize| (n * 4).max(4);
+        let mixed = self.take_scratch(fb(cd))?;
+        let zb = self.take_scratch(fb(vd))?;
+        let bb = self.take_scratch(fb(h))?;
+        let ab = self.take_scratch(fb(h))?;
+        let y = self.take_scratch(fb(cd))?;
+        let q_h = self.take_scratch(fb(h * hk))?;
+        let k_h = self.take_scratch(fb(h * hk))?;
+        let decay = self.take_scratch(fb(h))?;
+        let beta = self.take_scratch(fb(h))?;
+        let rec_out = self.take_scratch(fb(h * hv))?;
+        let gated = self.take_scratch(fb(vd))?;
+        let h1 = self.device.alloc(fb(hidden_dim))?;
+
+        let n_blk_in = (hidden_dim / kernels::q8_matmul::BLOCK_SIZE) as u32;
+        let n_blk_out = (vd / kernels::q8_matmul::BLOCK_SIZE) as u32;
+        let simds = kernels::q8_matmul::SIMDS_PER_GROUP as usize;
+        let tpg = simds * 32;
+        let groups = |n: usize| (n + simds - 1) / simds;
+
+        #[repr(C)] #[derive(Clone, Copy)]
+        struct NrmDims { batch: u32, n_rows: u32, n_blocks: u32, eps: f32 }
+        #[repr(C)] #[derive(Clone, Copy)]
+        struct ResDims { batch: u32, n_rows: u32, n_blocks: u32, pad: u32 }
+        #[repr(C)] #[derive(Clone, Copy)]
+        struct RecDims { num_heads: u32, pad0: u32, pad1: u32, pad2: u32 }
+        use kernels::gated_delta_block::{ConvDims, GatedNormDims, PrepDims};
+        macro_rules! push_bytes {
+            ($enc:expr, $val:expr, $idx:expr) => {{
+                let bytes = std::slice::from_raw_parts(
+                    &$val as *const _ as *const u8,
+                    std::mem::size_of_val(&$val),
+                );
+                $enc.push(bytes, $idx);
+            }};
+        }
+
+        unsafe {
+            aruminium::autorelease_pool(|| {
+                self.device.dispatch.batch_raw(|enc| {
+                    // 1) RmsNorm inlined into the four input projections.
+                    let projs: [(&aruminium::Buffer, &aruminium::Buffer, usize); 4] = [
+                        (w_bufs[0].as_buffer(), &mixed, cd),
+                        (w_bufs[1].as_buffer(), &zb, vd),
+                        (w_bufs[2].as_buffer(), &bb, h),
+                        (w_bufs[3].as_buffer(), &ab, h),
+                    ];
+                    for (w, out, n) in projs {
+                        enc.bind(&self.pipe_q8_large_nrm.0);
+                        enc.bind_buffer(x_buf.as_buffer(), 0, 0);
+                        enc.bind_buffer(gamma.as_buffer(), 0, 1);
+                        enc.bind_buffer(w, 0, 2);
+                        enc.bind_buffer(out, 0, 3);
+                        let dd = NrmDims { batch: 1, n_rows: n as u32, n_blocks: n_blk_in, eps: inp.eps };
+                        push_bytes!(enc, dd, 4);
+                        enc.launch_groups((groups(n), 1, 1), (tpg, 1, 1));
+                    }
+                    enc.memory_barrier_buffers();
+                    // 2) causal conv1d + SiLU; conv_state shifted in place.
+                    enc.bind(&bp.conv.0);
+                    enc.bind_buffer(&mixed, 0, 0);
+                    enc.bind_buffer(conv_w.as_buffer(), 0, 1);
+                    enc.bind_buffer(&layer.conv_state, 0, 2);
+                    enc.bind_buffer(&y, 0, 3);
+                    let cdims = ConvDims { channels: cd as u32, pad0: 0, pad1: 0, pad2: 0 };
+                    push_bytes!(enc, cdims, 4);
+                    enc.launch_groups(((cd + 255) / 256, 1, 1), (256, 1, 1));
+                    enc.memory_barrier_buffers();
+                    // 3) q/k split + head-expand + L2-norm + q scale; gates.
+                    enc.bind(&bp.prep.0);
+                    enc.bind_buffer(&y, 0, 0);
+                    enc.bind_buffer(&bb, 0, 1);
+                    enc.bind_buffer(&ab, 0, 2);
+                    enc.bind_buffer(a_log.as_buffer(), 0, 3);
+                    enc.bind_buffer(dt_bias.as_buffer(), 0, 4);
+                    enc.bind_buffer(&q_h, 0, 5);
+                    enc.bind_buffer(&k_h, 0, 6);
+                    enc.bind_buffer(&decay, 0, 7);
+                    enc.bind_buffer(&beta, 0, 8);
+                    let pdims = PrepDims {
+                        kd: kd as u32,
+                        num_heads: h as u32,
+                        q_scale: 1.0 / (hk as f32).sqrt(),
+                        l2_eps: 1e-6,
+                    };
+                    push_bytes!(enc, pdims, 9);
+                    enc.launch_groups((h, 1, 1), (hk, 1, 1));
+                    enc.memory_barrier_buffers();
+                    // 4) delta-rule recurrence on the persistent state; v is
+                    //    the third slice of the conv output.
+                    enc.bind(&pipe_rec.0);
+                    enc.bind_buffer(&layer.state, 0, 0);
+                    enc.bind_buffer(&q_h, 0, 1);
+                    enc.bind_buffer(&k_h, 0, 2);
+                    enc.bind_buffer(&y, 2 * kd * 4, 3);
+                    enc.bind_buffer(&decay, 0, 4);
+                    enc.bind_buffer(&beta, 0, 5);
+                    enc.bind_buffer(&rec_out, 0, 6);
+                    let rdims = RecDims { num_heads: h as u32, pad0: 0, pad1: 0, pad2: 0 };
+                    push_bytes!(enc, rdims, 7);
+                    enc.launch_groups((1, h, 1), (hv, 1, 1));
+                    enc.memory_barrier_buffers();
+                    // 5) RmsNormGated · SiLU(z).
+                    enc.bind(&bp.gnorm.0);
+                    enc.bind_buffer(&rec_out, 0, 0);
+                    enc.bind_buffer(&zb, 0, 1);
+                    enc.bind_buffer(norm_w.as_buffer(), 0, 2);
+                    enc.bind_buffer(&gated, 0, 3);
+                    let gdims = GatedNormDims { num_heads: h as u32, eps: inp.eps, pad0: 0, pad1: 0 };
+                    push_bytes!(enc, gdims, 4);
+                    enc.launch_groups((h, 1, 1), (hv, 1, 1));
+                    enc.memory_barrier_buffers();
+                    // 6) out_proj + residual → hidden1.
+                    enc.bind(&self.pipe_q8_large_res.0);
+                    enc.bind_buffer(&gated, 0, 0);
+                    enc.bind_buffer(w_bufs[4].as_buffer(), 0, 1);
+                    enc.bind_buffer(x_buf.as_buffer(), 0, 2);
+                    enc.bind_buffer(&h1, 0, 3);
+                    let odims = ResDims { batch: 1, n_rows: hidden_dim as u32, n_blocks: n_blk_out, pad: 0 };
+                    push_bytes!(enc, odims, 4);
+                    enc.launch_groups((groups(hidden_dim), 1, 1), (tpg, 1, 1));
+                });
+            });
+        }
+        for b in [mixed, zb, bb, ab, y, q_h, k_h, decay, beta, rec_out, gated] {
+            self.release_scratch(b);
+        }
+        Ok(Some(self.wrap_output(h1, vec![1, hidden_dim], DType::F32)))
     }
 
     fn gated_delta_recurrence_step(

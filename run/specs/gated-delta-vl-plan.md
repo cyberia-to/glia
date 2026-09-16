@@ -1023,3 +1023,63 @@ never applied to GatedDeltaNet's per-projection/per-recurrence-step
 dispatches. Fixing this (buffer pooling for GDN's hot-path allocations)
 is the next concrete, evidence-backed lever toward materially higher
 tok/s — not attempted this session; flagged for the next one.
+
+**Same day, later — that candidate was wrong; measured, then fixed the
+real one.** `run/examples/dispatch_overhead_bench.rs` decomposes one
+live Q8 matmul dispatch at GDN shapes: `dev.alloc()` of the output
+buffer is **2-5 µs** (not the bottleneck), but `submit+wait` wall clock
+exceeds `gpu_time()` by a fixed **~100-135 µs per command buffer** —
+Metal's scheduling latency each way — and `batch_raw` is synchronous
+(`commit` then `waitUntilCompleted`, `aruminium/src/dispatch.rs`). The
+per-op GDN layer pays that ~9 times per token (RmsNorm, 4 projections,
+recurrence, out_proj, residual, +FFN), and `gated_delta_recurrence_step`
+additionally `buffer_with_data`-uploads the full `[48,128,128]` state
+(~3 MB) and reads it back on **every** call — so the ~2 ms/layer of
+"missing" time was round-trips, not kernels.
+
+Fix — `Backend::gated_delta_block_fused` (run/backend/mod.rs, input
+struct `GatedDeltaBlockInput`): the whole GDN attention block for one
+decode token in ONE command buffer on honeycrisp:
+RmsNorm inlined into the 4 projections (`MSL_LARGE_NRM` ×4) → new
+`conv_silu` kernel (causal depthwise conv1d + SiLU, conv_state shifted
+in place on the GPU) → new `prep` kernel (q/k split, k-head→v-head
+expand, per-head L2-norm, q scale, beta/decay gates) → existing
+recurrence kernel against a **GPU-resident persistent state** → new
+`gated_norm` kernel (RmsNormGated · SiLU(z)) → `MSL_LARGE_RES`
+(out_proj + residual). Kernels: `run/backend/honeycrisp/kernels/
+gated_delta_block.rs`, each a direct transliteration of the CPU stage.
+State contract: host `state`/`conv_state` are read only at
+`past_seq_len == 0` (fresh sequence) and never written back per token;
+the per-op path stays as the fallback (`Ok(None)` for non-Q8 weights,
+T>1, or geometries the reduction kernels can't take) and as the
+reference. `to_backend()` now also uploads the four small f32 tensors
+(conv weight, A_log, dt_bias, gate-norm gain) so the block borrows them
+zero-copy.
+
+Verification on the real 27B checkpoint, not synthetic data:
+`GDN_FUSED_CHECK=1` runs BOTH paths for every GDN layer on every token
+and prints the divergence of the returned `hidden1` — **1488
+layer×position comparisons (48 layers × 31 positions), max abs diff
+3.05e-5, max relative 6.3e-7**, and the greedy output text is identical
+to the per-op path. `GDN_FUSED=0` disables the fused path.
+
+Result, same-session back-to-back `mr bench` (identical machine state):
+**per-op 165.0 ms/tok (6.1 tok/s) → fused 111.2 ms/tok (9.0 tok/s)**,
+1.48× — in line with the estimate from the sync-count analysis (~7
+round-trips × ~110 µs + the 3 MB state up/down, × 48 layers). Caveat on
+the measurement itself: `bench_e2e` caps timed steps at
+`floor(budget / first_forward)` (min 3), so a cache-cold first forward
+collapses the sample to 3 steps — two runs made under heavy host swap
+(23 GB used) plus a Lima VM `cargo build` at 200% CPU produced
+nonsense (92 s upload, 105 s first forward, 3 steps) and were
+discarded; the numbers above are from a quiet window. Use
+`--max-secs 120` for a full 40-step average.
+
+Remaining per-token cost model at ~111 ms: 48 GDN layers × (1 fused
+block + 1 `fused_ffn_residual`) + 16 Sdpa layers via
+`forward_decode_fused_layers`, i.e. ~130 command buffers/token ≈
+~15 ms of pure scheduling latency, the rest kernel time near the Q8
+bandwidth roofline. Next levers, in order: fold the FFN into the same
+command buffer as the GDN block (−48 round-trips), then batch
+consecutive GDN layers (3 in a row between each Sdpa layer in this
+model's `LLLF` pattern) into one command buffer (−96 more).
