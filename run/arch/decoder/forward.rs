@@ -201,9 +201,12 @@ impl LlamaModel {
         self.weights.final_norm = backend.to_backend(&self.weights.final_norm)?;
         let upload_quant = backend.uploads_quant_weights();
         if upload_quant {
-            self.weights.embed_tokens_quant.tensor =
-                backend.to_backend(&self.weights.embed_tokens_quant.tensor)?;
-            self.weights.embed_tokens_quant.bytes = Arc::new(Vec::new());
+            // embed_row still reads quantized host bytes during prefill/decode.
+            // Upload only when this table also serves the tied lm_head matmul.
+            if self.weights.lm_head.is_none() {
+                self.weights.embed_tokens_quant.tensor =
+                    backend.to_backend(&self.weights.embed_tokens_quant.tensor)?;
+            }
             if let Some(ref mut lm) = self.weights.lm_head {
                 lm.tensor = backend.to_backend(&lm.tensor)?;
                 lm.bytes = Arc::new(Vec::new());
