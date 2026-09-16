@@ -1187,6 +1187,34 @@ impl Backend for HoneycrispBackend {
         }
         let layer = gs.get(&inp.layer_idx).expect("inserted above");
 
+        // Optional folded FFN: same eligibility rules as the projections.
+        let inter = if let Some(f) = &inp.ffn {
+            let fw = [f.gate_w, f.up_w, f.down_w];
+            if !fw.iter().all(|w| on_gpu_q8(w)) || f.post_norm.dtype != DType::F32 {
+                return Ok(None);
+            }
+            let inter = f.gate_w.shape[0];
+            if inter % kernels::q8_matmul::BLOCK_SIZE != 0 {
+                return Ok(None);
+            }
+            let fexpect = [[inter, hidden_dim], [inter, hidden_dim], [hidden_dim, inter]];
+            for (w, e) in fw.iter().zip(fexpect.iter()) {
+                if w.shape[0] != e[0] || w.shape[1] != e[1] {
+                    return Err(BackendError::ShapeMismatch {
+                        op: OP, expected: e.to_vec(), got: w.shape.clone(),
+                    });
+                }
+            }
+            if f.post_norm.numel() != hidden_dim {
+                return Err(BackendError::ShapeMismatch {
+                    op: OP, expected: vec![hidden_dim], got: f.post_norm.shape.clone(),
+                });
+            }
+            Some(inter)
+        } else {
+            None
+        };
+
         let x_buf = self.buf_ref(inp.hidden)?;
         let gamma = self.buf_ref(inp.input_norm)?;
         let conv_w = self.buf_ref(inp.conv1d_weight)?;
@@ -1207,7 +1235,20 @@ impl Backend for HoneycrispBackend {
         let beta = self.take_scratch(fb(h))?;
         let rec_out = self.take_scratch(fb(h * hv))?;
         let gated = self.take_scratch(fb(vd))?;
-        let h1 = self.device.alloc(fb(hidden_dim))?;
+        // With the FFN folded in, h1 is an intermediate (scratch) and the
+        // returned tensor is the post-FFN layer output; otherwise h1 is it.
+        let (h1, ffn_bufs) = match inter {
+            Some(inter) => {
+                let f = inp.ffn.as_ref().expect("inter is Some only with ffn");
+                let fw = [f.gate_w, f.up_w, f.down_w];
+                let fw_bufs = fw.iter().map(|w| self.buf_ref(w)).collect::<Result<Vec<_>, _>>()?;
+                let post_norm = self.buf_ref(f.post_norm)?;
+                let mid = self.take_scratch(fb(inter))?;
+                let out = self.device.alloc(fb(hidden_dim))?;
+                (self.take_scratch(fb(hidden_dim))?, Some((fw_bufs, post_norm, mid, out, inter)))
+            }
+            None => (self.device.alloc(fb(hidden_dim))?, None),
+        };
 
         let n_blk_in = (hidden_dim / kernels::q8_matmul::BLOCK_SIZE) as u32;
         let n_blk_out = (vd / kernels::q8_matmul::BLOCK_SIZE) as u32;
@@ -1316,13 +1357,52 @@ impl Backend for HoneycrispBackend {
                     let odims = ResDims { batch: 1, n_rows: hidden_dim as u32, n_blocks: n_blk_out, pad: 0 };
                     push_bytes!(enc, odims, 4);
                     enc.launch_groups((groups(hidden_dim), 1, 1), (tpg, 1, 1));
+                    // 7) Folded FFN: post_norm+gate+up+SiLU in one kernel
+                    //    (4 rows per SIMD), then down+residual — the same
+                    //    two kernels `forward_decode_fused_layers` uses.
+                    if let Some((fw_bufs, post_norm, mid, out, inter)) = &ffn_bufs {
+                        let rows4 = simds * 4;
+                        let groups4 = |n: usize| (n + rows4 - 1) / rows4;
+                        enc.memory_barrier_buffers();
+                        enc.bind(&self.pipe_q8_large4_gus_nrm.0);
+                        enc.bind_buffer(&h1, 0, 0);
+                        enc.bind_buffer(post_norm.as_buffer(), 0, 1);
+                        enc.bind_buffer(fw_bufs[0].as_buffer(), 0, 2);
+                        enc.bind_buffer(fw_bufs[1].as_buffer(), 0, 3);
+                        enc.bind_buffer(mid, 0, 4);
+                        let gdims = NrmDims { batch: 1, n_rows: *inter as u32, n_blocks: n_blk_in, eps: inp.eps };
+                        push_bytes!(enc, gdims, 5);
+                        enc.launch_groups((groups4(*inter), 1, 1), (tpg, 1, 1));
+                        enc.memory_barrier_buffers();
+                        enc.bind(&self.pipe_q8_large4_res.0);
+                        enc.bind_buffer(mid, 0, 0);
+                        enc.bind_buffer(fw_bufs[2].as_buffer(), 0, 1);
+                        enc.bind_buffer(&h1, 0, 2);
+                        enc.bind_buffer(out, 0, 3);
+                        let ddims = ResDims {
+                            batch: 1,
+                            n_rows: hidden_dim as u32,
+                            n_blocks: (*inter / kernels::q8_matmul::BLOCK_SIZE) as u32,
+                            pad: 0,
+                        };
+                        push_bytes!(enc, ddims, 4);
+                        enc.launch_groups((groups4(hidden_dim), 1, 1), (tpg, 1, 1));
+                    }
                 });
             });
         }
         for b in [mixed, zb, bb, ab, y, q_h, k_h, decay, beta, rec_out, gated] {
             self.release_scratch(b);
         }
-        Ok(Some(self.wrap_output(h1, vec![1, hidden_dim], DType::F32)))
+        let result = match ffn_bufs {
+            Some((_, _, mid, out, _)) => {
+                self.release_scratch(mid);
+                self.release_scratch(h1);
+                out
+            }
+            None => h1,
+        };
+        Ok(Some(self.wrap_output(result, vec![1, hidden_dim], DType::F32)))
     }
 
     fn gated_delta_recurrence_step(

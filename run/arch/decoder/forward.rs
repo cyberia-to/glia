@@ -742,6 +742,9 @@ fn forward_layer(
     // differs. Spec: ops.md §"GatedDeltaNet".
     let is_linear_attn = config.layer_types.get(layer_idx).copied()
         == Some(crate::arch::decoder::config::LayerKind::LinearAttn);
+    // Set when the fused GatedDeltaNet block also ran this layer's FFN —
+    // the shared epilogue below then skips it.
+    let mut gdn_layer_out: Option<Tensor> = None;
     let hidden1: Tensor = if is_linear_attn {
         let t_gdn = Instant::now();
         let Some(la) = &layer.linear_attn else {
@@ -773,10 +776,29 @@ fn forward_layer(
         // real weights.
         let fused_off = std::env::var("GDN_FUSED").map(|v| v == "0").unwrap_or(false);
         let fused_check = std::env::var("GDN_FUSED_CHECK").is_ok();
+        // Fold the FFN into the same command buffer under exactly the
+        // conditions the shared epilogue's fused_ffn_residual arm accepts.
+        // Not in check mode: the check compares hidden1 (pre-FFN) between
+        // the two paths.
+        let fold_ffn = !fused_check
+            && config.hidden_activation == crate::arch::decoder::config::HiddenActivation::Silu
+            && layer.post_ffw_norm.is_none()
+            && layer.layer_output_scale.is_none()
+            && !debug_l0;
         let fused_h1 = if fused_off {
             None
         } else {
             let inp = crate::backend::GatedDeltaBlockInput {
+                ffn: if fold_ffn {
+                    Some(crate::backend::GatedDeltaFfnInput {
+                        post_norm: &layer.post_norm,
+                        gate_w: &layer.gate_proj.tensor,
+                        up_w: &layer.up_proj.tensor,
+                        down_w: &layer.down_proj.tensor,
+                    })
+                } else {
+                    None
+                },
                 layer_idx,
                 hidden,
                 input_norm: &layer.input_norm,

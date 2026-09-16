@@ -77,6 +77,20 @@ pub struct GatedDeltaBlockInput<'a> {
     /// sequence: the backend re-seeds its persistent state from the host
     /// slices then; afterwards the backend's own copy is the live one.
     pub past_seq_len: usize,
+    /// When given, the backend also runs the layer's SiLU FFN
+    /// (post_norm → gate/up → SiLU(gate)·up → down → +residual) in the SAME
+    /// command buffer and returns the full layer output instead of
+    /// `hidden + gdn_out`. All-or-nothing: a backend that returns `Some`
+    /// has applied it; one that can't returns `None` for the whole block.
+    pub ffn: Option<GatedDeltaFfnInput<'a>>,
+}
+
+/// SiLU FFN weights for `GatedDeltaBlockInput::ffn` (quant, GPU-resident).
+pub struct GatedDeltaFfnInput<'a> {
+    pub post_norm: &'a Tensor, // [hidden] f32
+    pub gate_w: &'a Tensor,    // [inter, hidden]
+    pub up_w: &'a Tensor,      // [inter, hidden]
+    pub down_w: &'a Tensor,    // [hidden, inter]
 }
 
 /// Three backends + cpu reference library.
