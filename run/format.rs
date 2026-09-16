@@ -130,21 +130,21 @@ pub fn read_model_file(path: &Path) -> Result<ModelFile, FormatError> {
     let file = std::fs::File::open(path)?;
     let file_len = file.metadata()?.len() as usize;
 
-    // Text header scan: read up to 32 MB to find ~~~weights\n marker.
-    // Gemma-4 has ~18 MB of tensor index.
-    let scan_limit = file_len.min(32 * 1024 * 1024);
-    let mut reader = std::io::BufReader::new(&file);
-    let mut header = vec![0u8; scan_limit];
-    use std::io::Read;
-    reader.read_exact(&mut header)?;
-
+    // Text header scan: find the ~~~weights\n marker. The marker can sit
+    // far into the file — a large vocab section precedes it (the CT-0
+    // compile of bostrom carries ~450 MB of vocab text before weights,
+    // which the old 32 MB read-ahead cap rejected as "no ~~~weights
+    // section"). mmap the whole file and scan it: the marker search is
+    // a single memchr-class pass, and the mmap is reused below for the
+    // large-model zero-copy path either way.
+    let mmap = unsafe { memmap2::Mmap::map(&file)? };
     let marker = b"~~~weights\n";
-    let marker_pos = header
+    let marker_pos = mmap
         .windows(marker.len())
         .position(|w| w == marker)
         .ok_or_else(|| FormatError::Invalid("no ~~~weights section".into()))?;
 
-    let text_part = std::str::from_utf8(&header[..marker_pos])
+    let text_part = std::str::from_utf8(&mmap[..marker_pos])
         .map_err(|e| FormatError::Invalid(format!("non-utf8 text header: {e}")))?;
 
     // Reject pre-canonical files. Frontmatter must declare the canonical
@@ -172,15 +172,9 @@ pub fn read_model_file(path: &Path) -> Result<ModelFile, FormatError> {
     let weights_start = marker_pos + marker.len();
     let weights_end = (weights_start + weights_size).min(file_len);
     let weights = if file_len > 1_000_000_000 {
-        drop(reader);
-        let mmap = unsafe { memmap2::Mmap::map(&file)? };
         WeightBytes::Mapped { mmap, weights_start }
-    } else if weights_end <= header.len() {
-        WeightBytes::Owned(header[weights_start..weights_end].to_vec())
     } else {
-        drop(reader);
-        let data = std::fs::read(path)?;
-        WeightBytes::Owned(data[weights_start..weights_end].to_vec())
+        WeightBytes::Owned(mmap[weights_start..weights_end].to_vec())
     };
 
     // Decode the optional hex-encoded graph section.
