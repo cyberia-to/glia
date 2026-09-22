@@ -124,6 +124,7 @@ fn ir_exec_matches_curated_qwen3_0_6b() {
         max_seq_len: config.max_position_embeddings.min(8192),
         activation,
         has_qk_norm: config.has_qk_norm,
+        has_attn_bias: config.has_attn_bias,
     };
 
     eprintln!(
