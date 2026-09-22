@@ -63,7 +63,13 @@ pub fn matmul_f32(x: &Tensor, w: &Tensor) -> Result<Tensor, BackendError> {
 /// 8-wide SIMD dot product with scalar tail.
 #[inline]
 pub fn simd_dot_f32(a: &[f32], b: &[f32]) -> f32 {
-    debug_assert_eq!(a.len(), b.len());
+    assert_eq!(
+        a.len(),
+        b.len(),
+        "simd_dot_f32: operand length mismatch (a={}, b={})",
+        a.len(),
+        b.len()
+    );
     let k = a.len();
     let simd_tail = k % 8;
     let simd_end = k - simd_tail;
@@ -159,5 +165,26 @@ mod tests {
             }
         }
         assert!(worst < 1e-3, "simd vs scalar worst diff: {worst}");
+    }
+
+    #[test]
+    fn simd_dot_f32_matches_scalar_with_tail() {
+        // k = 11 is not a multiple of 8, so this exercises the scalar tail.
+        let a: Vec<f32> = (0..11).map(|i| i as f32).collect();
+        let b: Vec<f32> = (0..11).map(|i| (i as f32) * 0.5).collect();
+        let expected: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+        assert!((simd_dot_f32(&a, &b) - expected).abs() < 1e-4);
+    }
+
+    #[test]
+    #[should_panic(expected = "operand length mismatch")]
+    fn simd_dot_f32_panics_on_length_mismatch() {
+        // Was a debug_assert_eq!, compiled out in release: k = a.len()
+        // drives every index into both slices, so a longer `b` was
+        // silently truncated to a's length (a wrong partial dot product,
+        // no panic anywhere) instead of failing here.
+        let a = vec![1.0f32; 5];
+        let b = vec![1.0f32; 9];
+        simd_dot_f32(&a, &b);
     }
 }
