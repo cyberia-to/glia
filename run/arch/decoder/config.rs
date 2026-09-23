@@ -6,10 +6,21 @@ use crate::format::FormatError;
 /// Per-layer attention kind. LlamaStyle has all `Sliding` (single shape).
 /// LlamaStyle+ (Gemma 3/4) interleaves `Sliding` and `Full`; full layers
 /// in Gemma 4 use `global_head_dim` / `num_global_key_value_heads`.
+/// Qwen3.5/3.8/3-Next interleave `Sliding`/`Full` (relabeled "full" vs
+/// everything else by the source `layer_types`) with `LinearAttn` — a
+/// GatedDeltaNet layer that replaces Sdpa entirely (spec: ops.md
+/// §"GatedDeltaNet"). `LinearAttn` deliberately has NO defaults here:
+/// every `layer_head_dim`/`layer_kv_heads`/`layer_window`/`layer_rope_*`
+/// method below is Sliding/Full-shaped math that does not apply to it,
+/// and `forward_layer` must branch to `backend::cpu::gated_delta` before
+/// calling any of them for a `LinearAttn` layer — see that dispatch's own
+/// comment for why silently falling through here used to be a bug, not
+/// a feature.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LayerKind {
     Sliding,
     Full,
+    LinearAttn,
 }
 
 /// Activation function for the FFN gate.
@@ -65,6 +76,10 @@ pub struct LlamaConfig {
     /// (`partial_rotary_factor`, e.g. 0.25). Sliding layers always rotate
     /// the full head_dim. None = no partial rotary.
     pub partial_rotary_factor_full: Option<f32>,
+    /// Qwen3.5/3.8: interleaved 3D mRoPE frequency-axis split (e.g.
+    /// `[11, 11, 10]`, sums to `rope_dim/2`). `None` for every other
+    /// family — plain 1D RoPE. Spec: ops.md §"mRoPE, interleaved".
+    pub mrope_section: Option<[usize; 3]>,
     /// Gemma family: divisor for attention scaling. Default per HF Gemma 3
     /// is 256 regardless of head_dim. LlamaStyle defaults to head_dim
     /// (standard 1/sqrt(head_dim)). Affects full layers most because their
@@ -75,6 +90,42 @@ pub struct LlamaConfig {
     /// Runtime code reads `family.*` fields instead of matching on the
     /// string — see `families/` for the per-family profiles.
     pub family: FamilyProfile,
+
+    // ── GatedDeltaNet dims (Qwen3.5/3.8/3-Next) ──
+    // Spec: run/specs/ops.md §"GatedDeltaNet". `None` unless
+    // `layer_types` contains at least one `LinearAttn` — plain
+    // LlamaStyle/LlamaStyle+ models never populate these.
+    pub linear_num_value_heads: Option<usize>,
+    pub linear_num_key_heads: Option<usize>,
+    pub linear_key_head_dim: Option<usize>,
+    pub linear_value_head_dim: Option<usize>,
+    pub linear_conv_kernel_dim: Option<usize>,
+
+    // ── Native VL (Qwen3.5/3.8) — vision tower + fusion ──
+    // Spec: ops.md §"VisionTower". `None` for text-only models.
+    pub vision: Option<VisionConfig>,
+    pub image_token_id: Option<u32>,
+    pub video_token_id: Option<u32>,
+    pub vision_start_token_id: Option<u32>,
+    pub vision_end_token_id: Option<u32>,
+}
+
+/// `[architecture.vision]` — the native VL vision tower's own config,
+/// separate from the text decoder's `hidden_size`/etc. Spec: ops.md
+/// §"VisionTower".
+#[derive(Clone, Copy, Debug)]
+pub struct VisionConfig {
+    pub hidden_size: usize,
+    pub num_heads: usize,
+    pub intermediate_size: usize,
+    pub depth: usize,
+    pub patch_size: usize,
+    pub in_channels: usize,
+    pub spatial_merge_size: usize,
+    pub temporal_patch_size: usize,
+    pub num_position_embeddings: usize,
+    pub out_hidden_size: usize,
+    pub rope_theta: f32,
 }
 
 impl LlamaConfig {
@@ -295,6 +346,12 @@ impl LlamaConfig {
                     .filter_map(|v| v.as_str())
                     .map(|s| match s {
                         "full_attention" | "full" => LayerKind::Full,
+                        // Was silently landing in the `_ => Sliding` arm
+                        // below (Qwen3.8-27B: 48 of 64 layers) — Sliding
+                        // means "run Sdpa against self_attn tensors that
+                        // do not exist on this layer" (it has linear_attn.*
+                        // instead). See LayerKind's doc comment.
+                        "linear_attention" => LayerKind::LinearAttn,
                         _ => LayerKind::Sliding,
                     })
                     .collect()
@@ -345,6 +402,12 @@ impl LlamaConfig {
             .get("partial_rotary_factor_full")
             .and_then(|v| v.as_float().or_else(|| v.as_integer().map(|i| i as f64)))
             .map(|f| f as f32);
+        let mrope_section: Option<[usize; 3]> = arch
+            .get("mrope_section")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_integer()).map(|i| i as usize).collect::<Vec<_>>())
+            .filter(|v| v.len() == 3)
+            .map(|v| [v[0], v[1], v[2]]);
         // Explicit config value wins; family profile supplies defaults for
         // families that need a non-head_dim scalar.
         let query_pre_attn_scalar = arch
@@ -352,6 +415,51 @@ impl LlamaConfig {
             .and_then(|v| v.as_integer())
             .map(|i| i as usize);
         let family = FamilyProfile::for_model_type(&model_type, query_pre_attn_scalar);
+        let linear_num_value_heads = arch
+            .get("linear_num_value_heads")
+            .and_then(|v| v.as_integer())
+            .map(|i| i as usize);
+        let linear_num_key_heads = arch
+            .get("linear_num_key_heads")
+            .and_then(|v| v.as_integer())
+            .map(|i| i as usize);
+        let linear_key_head_dim = arch
+            .get("linear_key_head_dim")
+            .and_then(|v| v.as_integer())
+            .map(|i| i as usize);
+        let linear_value_head_dim = arch
+            .get("linear_value_head_dim")
+            .and_then(|v| v.as_integer())
+            .map(|i| i as usize);
+        let linear_conv_kernel_dim = arch
+            .get("linear_conv_kernel_dim")
+            .and_then(|v| v.as_integer())
+            .map(|i| i as usize);
+
+        let image_token_id = arch.get("image_token_id").and_then(|v| v.as_integer()).map(|i| i as u32);
+        let video_token_id = arch.get("video_token_id").and_then(|v| v.as_integer()).map(|i| i as u32);
+        let vision_start_token_id =
+            arch.get("vision_start_token_id").and_then(|v| v.as_integer()).map(|i| i as u32);
+        let vision_end_token_id =
+            arch.get("vision_end_token_id").and_then(|v| v.as_integer()).map(|i| i as u32);
+        let vision = arch.get("vision").map(|vc| {
+            let vget = |key: &str, default: usize| -> usize {
+                vc.get(key).and_then(|v| v.as_integer()).map(|i| i as usize).unwrap_or(default)
+            };
+            VisionConfig {
+                hidden_size: vget("hidden_size", 1152),
+                num_heads: vget("num_heads", 16),
+                intermediate_size: vget("intermediate_size", 4304),
+                depth: vget("depth", 27),
+                patch_size: vget("patch_size", 16),
+                in_channels: vget("in_channels", 3),
+                spatial_merge_size: vget("spatial_merge_size", 2),
+                temporal_patch_size: vget("temporal_patch_size", 2),
+                num_position_embeddings: vget("num_position_embeddings", 2304),
+                out_hidden_size: vget("out_hidden_size", hidden_size),
+                rope_theta: vc.get("rope_theta").and_then(|v| v.as_integer()).map(|i| i as f32).unwrap_or(10000.0),
+            }
+        });
 
         Ok(Self {
             model_type,
@@ -378,8 +486,19 @@ impl LlamaConfig {
             num_global_key_value_heads,
             rope_theta_full,
             partial_rotary_factor_full,
+            mrope_section,
             query_pre_attn_scalar,
             family,
+            linear_num_value_heads,
+            linear_num_key_heads,
+            linear_key_head_dim,
+            linear_value_head_dim,
+            linear_conv_kernel_dim,
+            vision,
+            image_token_id,
+            video_token_id,
+            vision_start_token_id,
+            vision_end_token_id,
         })
     }
 }

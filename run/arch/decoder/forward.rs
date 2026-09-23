@@ -23,6 +23,18 @@ pub struct LlamaModel {
     /// KV cache per layer: K and V tensors shape [kv_heads, max_seq, head_dim].
     pub past_seq_len: usize,
     pub kv_cache: Vec<(Vec<f32>, Vec<f32>)>,
+    /// GatedDeltaNet recurrent state per layer — `Some([num_v_heads *
+    /// head_k_dim * head_v_dim])` for `LinearAttn` layers, `None` for
+    /// every other layer (spec: ops.md §"GatedDeltaNet"). Fixed size,
+    /// mutated in place every call — the KV-cache analogue for layers
+    /// that carry no KV cache at all.
+    pub gdn_state: Vec<Option<Vec<f32>>>,
+    /// GatedDeltaNet causal-conv1d left-context cache per layer —
+    /// `Some([conv_dim * (kernel_size-1)])` for `LinearAttn` layers,
+    /// `None` otherwise. See `gated_delta::gated_delta_forward`'s doc
+    /// comment: without this, every decode step's conv1d silently
+    /// treats itself as the first token of a fresh sequence.
+    pub gdn_conv_state: Vec<Option<Vec<f32>>>,
     /// Per-op timing accumulator. Reset via `reset_prof`, read via `prof`.
     pub prof: ForwardProf,
 }
@@ -100,6 +112,22 @@ impl ForwardProf {
     }
 }
 
+/// Per-call override for multimodal (image/video) tokens — see ops.md
+/// §"mRoPE, interleaved" and gated-delta-vl-plan.md's fusion trace.
+/// Both fields are independent: a text token inside a multimodal
+/// sequence needs `position` (every token does, once any image is
+/// present) but not `embed`; an image-placeholder token needs both.
+pub struct TokenOverride {
+    /// Replaces the normal `embed_row` lookup outright — the vision
+    /// tower's own output row for this image-placeholder position.
+    pub embed: Option<Vec<f32>>,
+    /// `(t, h, w)` from `mrope_position_ids`, replacing the plain
+    /// scalar `past_seq_len` position for every `full_attention`
+    /// layer's RoPE. `linear_attention` (GatedDeltaNet) layers ignore
+    /// this entirely — they never rotate.
+    pub position: Option<[f32; 3]>,
+}
+
 impl LlamaModel {
     pub fn load(path: &Path) -> Result<Self, FormatError> {
         let lm = LoadedModel::load(path)?;
@@ -120,11 +148,40 @@ impl LlamaModel {
                 (vec![0f32; sz], vec![0f32; sz])
             })
             .collect();
+        let gdn_state = (0..config.num_hidden_layers)
+            .map(|i| {
+                let is_linear_attn = config.layer_types.get(i).copied()
+                    == Some(super::config::LayerKind::LinearAttn);
+                if !is_linear_attn {
+                    return None;
+                }
+                let sz = config.linear_num_value_heads.unwrap_or(0)
+                    * config.linear_key_head_dim.unwrap_or(0)
+                    * config.linear_value_head_dim.unwrap_or(0);
+                Some(vec![0f32; sz])
+            })
+            .collect();
+        let gdn_conv_state = (0..config.num_hidden_layers)
+            .map(|i| {
+                let is_linear_attn = config.layer_types.get(i).copied()
+                    == Some(super::config::LayerKind::LinearAttn);
+                if !is_linear_attn {
+                    return None;
+                }
+                let key_dim = config.linear_num_key_heads.unwrap_or(0) * config.linear_key_head_dim.unwrap_or(0);
+                let value_dim = config.linear_num_value_heads.unwrap_or(0) * config.linear_value_head_dim.unwrap_or(0);
+                let conv_dim = key_dim * 2 + value_dim;
+                let kernel_size = config.linear_conv_kernel_dim.unwrap_or(1);
+                Some(vec![0f32; conv_dim * kernel_size.saturating_sub(1)])
+            })
+            .collect();
         Ok(Self {
             config,
             weights,
             past_seq_len: 0,
             kv_cache,
+            gdn_state,
+            gdn_conv_state,
             prof: ForwardProf::default(),
         })
     }
@@ -144,9 +201,12 @@ impl LlamaModel {
         self.weights.final_norm = backend.to_backend(&self.weights.final_norm)?;
         let upload_quant = backend.uploads_quant_weights();
         if upload_quant {
-            self.weights.embed_tokens_quant.tensor =
-                backend.to_backend(&self.weights.embed_tokens_quant.tensor)?;
-            self.weights.embed_tokens_quant.bytes = Arc::new(Vec::new());
+            // embed_row still reads quantized host bytes during prefill/decode.
+            // Upload only when this table also serves the tied lm_head matmul.
+            if self.weights.lm_head.is_none() {
+                self.weights.embed_tokens_quant.tensor =
+                    backend.to_backend(&self.weights.embed_tokens_quant.tensor)?;
+            }
             if let Some(ref mut lm) = self.weights.lm_head {
                 lm.tensor = backend.to_backend(&lm.tensor)?;
                 lm.bytes = Arc::new(Vec::new());
@@ -177,20 +237,64 @@ impl LlamaModel {
                 layer.post_ffw_norm = Some(backend.to_backend(n)?);
             }
             if upload_quant {
-                layer.q_proj.tensor    = backend.to_backend(&layer.q_proj.tensor)?;
-                layer.q_proj.bytes     = Arc::new(Vec::new());
-                layer.k_proj.tensor    = backend.to_backend(&layer.k_proj.tensor)?;
-                layer.k_proj.bytes     = Arc::new(Vec::new());
-                layer.v_proj.tensor    = backend.to_backend(&layer.v_proj.tensor)?;
-                layer.v_proj.bytes     = Arc::new(Vec::new());
-                layer.o_proj.tensor    = backend.to_backend(&layer.o_proj.tensor)?;
-                layer.o_proj.bytes     = Arc::new(Vec::new());
+                // GatedDeltaNet ("linear_attention") layers carry
+                // zero-size PLACEHOLDER self_attn.* QuantWeights (see
+                // weights.rs's `load_layer` LinearAttn branch — they're
+                // never read, `forward_layer` branches to
+                // `backend::cpu::gated_delta` before touching them).
+                // Uploading a 0-element tensor makes honeycrisp's Metal
+                // buffer allocation fail outright — skip them here,
+                // found via `e2e_multimodal.rs`'s honeycrisp variant.
+                let is_real = |t: &Tensor| t.numel() > 0;
+                if is_real(&layer.q_proj.tensor) {
+                    layer.q_proj.tensor = backend.to_backend(&layer.q_proj.tensor)?;
+                    layer.q_proj.bytes  = Arc::new(Vec::new());
+                }
+                if is_real(&layer.k_proj.tensor) {
+                    layer.k_proj.tensor = backend.to_backend(&layer.k_proj.tensor)?;
+                    layer.k_proj.bytes  = Arc::new(Vec::new());
+                }
+                if is_real(&layer.v_proj.tensor) {
+                    layer.v_proj.tensor = backend.to_backend(&layer.v_proj.tensor)?;
+                    layer.v_proj.bytes  = Arc::new(Vec::new());
+                }
+                if is_real(&layer.o_proj.tensor) {
+                    layer.o_proj.tensor = backend.to_backend(&layer.o_proj.tensor)?;
+                    layer.o_proj.bytes  = Arc::new(Vec::new());
+                }
                 layer.gate_proj.tensor = backend.to_backend(&layer.gate_proj.tensor)?;
                 layer.gate_proj.bytes  = Arc::new(Vec::new());
                 layer.up_proj.tensor   = backend.to_backend(&layer.up_proj.tensor)?;
                 layer.up_proj.bytes    = Arc::new(Vec::new());
                 layer.down_proj.tensor = backend.to_backend(&layer.down_proj.tensor)?;
                 layer.down_proj.bytes  = Arc::new(Vec::new());
+                // GatedDeltaNet's own five big projections — real quant
+                // weights (unlike the zero-size self_attn.* placeholders
+                // above), so no `is_real` guard needed. Uploading these
+                // is what lets `gated_delta_forward`'s `proj_matmul`
+                // dispatch through `backend.quant_matmul` instead of
+                // re-dequantizing from host bytes on every token.
+                if let Some(ref mut la) = layer.linear_attn {
+                    la.in_proj_qkv.tensor = backend.to_backend(&la.in_proj_qkv.tensor)?;
+                    la.in_proj_qkv.bytes  = Arc::new(Vec::new());
+                    la.in_proj_z.tensor   = backend.to_backend(&la.in_proj_z.tensor)?;
+                    la.in_proj_z.bytes    = Arc::new(Vec::new());
+                    la.in_proj_b.tensor   = backend.to_backend(&la.in_proj_b.tensor)?;
+                    la.in_proj_b.bytes    = Arc::new(Vec::new());
+                    la.in_proj_a.tensor   = backend.to_backend(&la.in_proj_a.tensor)?;
+                    la.in_proj_a.bytes    = Arc::new(Vec::new());
+                    la.out_proj.tensor    = backend.to_backend(&la.out_proj.tensor)?;
+                    la.out_proj.bytes     = Arc::new(Vec::new());
+                    // The four small f32 tensors too, so the fused block
+                    // borrows them zero-copy instead of re-uploading
+                    // ~260 KB of conv weights per layer per token. The
+                    // per-op path's `.as_f32()` still reads them (shared
+                    // storage).
+                    la.conv1d_weight = backend.to_backend(&la.conv1d_weight)?;
+                    la.a_log         = backend.to_backend(&la.a_log)?;
+                    la.dt_bias       = backend.to_backend(&la.dt_bias)?;
+                    la.norm_weight   = backend.to_backend(&la.norm_weight)?;
+                }
             }
         }
         Ok(())
@@ -198,6 +302,17 @@ impl LlamaModel {
 
     pub fn reset_kv_cache(&mut self) {
         self.past_seq_len = 0;
+        // Unlike the Sdpa cache (guarded by past_seq_len, stale bytes past
+        // it are never read), GatedDeltaNet's state has no length guard —
+        // every call reads and updates it directly. Must be zeroed for
+        // real, not just logically forgotten, or a new conversation would
+        // start from the previous one's recurrent state.
+        for s in self.gdn_state.iter_mut().flatten() {
+            s.fill(0.0);
+        }
+        for s in self.gdn_conv_state.iter_mut().flatten() {
+            s.fill(0.0);
+        }
     }
 
     /// Single forward step: input one token, get logits for next.
@@ -208,6 +323,19 @@ impl LlamaModel {
         &mut self,
         token_id: u32,
         backend: &dyn Backend,
+    ) -> Result<Vec<f32>, BackendError> {
+        self.forward_ex(token_id, backend, None)
+    }
+
+    /// Same as `forward`, with an optional multimodal override — see
+    /// `TokenOverride`'s doc comment. `forward` is the plain text-only
+    /// entry point (`override_ = None`); nothing about its behavior
+    /// changes here, this only adds a new path.
+    pub fn forward_ex(
+        &mut self,
+        token_id: u32,
+        backend: &dyn Backend,
+        override_: Option<&TokenOverride>,
     ) -> Result<Vec<f32>, BackendError> {
         let c = &self.config;
 
@@ -235,12 +363,13 @@ impl LlamaModel {
         let prof_enabled = self.prof.enabled;
         let t_embed = Instant::now();
 
-        // Embed lookup: one row of embed_tokens.
-        let embed_table = &self.weights.embed_tokens;
+        // Embed lookup: dequantize ONLY this one row, never the whole
+        // table (`Weights::embed_row` — see its doc comment for why: a
+        // large-vocab model's table dequantized whole was ~5 GB held for
+        // single-row reads).
         let hidden_size = c.hidden_size;
         // One-shot diagnostic: dump stats for specific rows on first call.
         if std::env::var("RUN_DEBUG_EMBED_ROWS").is_ok() && self.past_seq_len == 0 {
-            let table = embed_table.try_as_f32()?;
             let rows_to_check: Vec<usize> = std::env::var("RUN_DEBUG_EMBED_ROWS")
                 .ok()
                 .map(|s| {
@@ -250,25 +379,33 @@ impl LlamaModel {
                 })
                 .unwrap_or_default();
             for r in &rows_to_check {
-                let s = r * hidden_size;
-                let row = &table[s..s + hidden_size];
+                let row = self.weights.embed_row(*r, c.vocab_size)
+                    .map_err(|e| BackendError::Internal(e.to_string()))?;
                 let m = row.iter().map(|v| v.abs()).fold(0f32, f32::max);
                 let rms = (row.iter().map(|v| v * v).sum::<f32>() / hidden_size as f32).sqrt();
                 let mean = row.iter().sum::<f32>() / hidden_size as f32;
                 eprintln!("embed row {r:>6}: abs_max={m:>8.4} rms={rms:>7.4} mean={mean:>9.5}");
             }
         }
-        let row_start = (token_id as usize) * hidden_size;
-        let mut embed_row: Vec<f32> = embed_table.try_as_f32()?[row_start..row_start + hidden_size].to_vec();
-        // Families that scale embeddings by sqrt(hidden_size) on lookup
-        // (Gemma 1/2/3/4). The flag is set once on the family profile.
-        if c.family.scaled_embeddings {
-            let scale = (hidden_size as f32).sqrt();
-            for v in embed_row.iter_mut() {
-                *v *= scale;
+        let mut hidden = if let Some(emb) = override_.and_then(|o| o.embed.as_ref()) {
+            // Image/video-placeholder position: the vision tower's own
+            // output row replaces the token embedding outright — no
+            // lookup, no scaled_embeddings (that's a text-embedding-
+            // table quirk, doesn't apply to vision features).
+            Tensor::try_from_f32(vec![1, hidden_size], emb.clone())?
+        } else {
+            let mut embed_row: Vec<f32> = self.weights.embed_row(token_id as usize, c.vocab_size)
+                .map_err(|e| BackendError::Internal(e.to_string()))?;
+            // Families that scale embeddings by sqrt(hidden_size) on lookup
+            // (Gemma 1/2/3/4). The flag is set once on the family profile.
+            if c.family.scaled_embeddings {
+                let scale = (hidden_size as f32).sqrt();
+                for v in embed_row.iter_mut() {
+                    *v *= scale;
+                }
             }
-        }
-        let mut hidden = Tensor::try_from_f32(vec![1, hidden_size], embed_row)?;
+            Tensor::try_from_f32(vec![1, hidden_size], embed_row)?
+        };
 
         if prof_enabled {
             self.prof.embed_ms += t_embed.elapsed().as_secs_f64() * 1000.0;
@@ -276,6 +413,26 @@ impl LlamaModel {
 
         let pos = self.past_seq_len as f32;
         let pos_tensor = Tensor::from_f32(vec![1], vec![pos]);
+        // 3D mRoPE position — see `TokenOverride`'s doc comment for the
+        // explicit-override (multimodal) case. But ANY model that has
+        // `mrope_section` at all (Qwen3.5/3.8) must ALWAYS take this
+        // path, even for plain text with no image in sight: its
+        // `full_attention` layers' partial rotary uses a CONTIGUOUS-
+        // PREFIX index layout (`apply_rope_cos_sin_f32`), not the
+        // interleaved-pairs-across-full-head_dim layout every existing
+        // `Op::Rope` implementation (CPU `rope_f32`, honeycrisp's MSL
+        // rope kernels) was built for (Gemma-4's "proportional" rope
+        // type — see ops.md's "mRoPE, interleaved" note). A plain-text
+        // position collapses to `t=h=w=pos` exactly, which is why this
+        // single flag correctly covers both cases: no explicit
+        // override needed to get correct math, only to get correct
+        // EMBEDDINGS (image tokens still need `TokenOverride.embed`).
+        // Forces the per-layer fallback path below (skips the fused
+        // cross-layer GPU dispatch, which only knows the plain
+        // scalar-pos Op::Rope path) — same precedent as LinearAttn.
+        let mrope_pos: Option<[f32; 3]> = override_
+            .and_then(|o| o.position)
+            .or_else(|| c.mrope_section.map(|_| [pos, pos, pos]));
 
         let debug_layers = std::env::var("RUN_DEBUG_LAYERS").is_ok();
         if debug_layers {
@@ -333,15 +490,39 @@ impl LlamaModel {
             .ok().and_then(|s| s.parse().ok()).unwrap_or(usize::MAX);
         let fused_debug = std::env::var("FUSED_DEBUG").is_ok();
         let used_fused;
-        if !debug_layers && !prof_enabled {
+        if !debug_layers && !prof_enabled && mrope_pos.is_none() {
             let mut li = 0;  // next layer index to process
             let mut any_fused = false;
             loop {
                 if li >= c.num_hidden_layers { break; }
+                // GatedDeltaNet layers have no q/k/v/window geometry at all —
+                // `layer_head_dim`/`layer_kv_heads` return LlamaStyle
+                // fallback numbers for them (meaningless, never Sdpa-shaped
+                // in reality) that would otherwise make this grouping loop
+                // treat them as an ordinary uniform Sliding group and hand
+                // them to a fused GPU kernel that has never heard of
+                // linear_attn.* tensors. Force single-layer groups through
+                // the per-layer fallback below instead, where forward_layer
+                // routes them to backend::cpu::gated_delta.
+                let is_linear_attn = |i: usize| {
+                    c.layer_types.get(i).copied()
+                        == Some(crate::arch::decoder::config::LayerKind::LinearAttn)
+                };
+                if is_linear_attn(li) {
+                    hidden = forward_layer(
+                        &hidden, li, &self.weights.layers[li], c, &pos_tensor, backend,
+                        &mut self.kv_cache[li], self.past_seq_len, None,
+                        self.gdn_state[li].as_deref_mut(), self.gdn_conv_state[li].as_deref_mut(), None,
+                    )?;
+                    li += 1;
+                    any_fused = true; // "handled", not literally a fused-GPU group
+                    continue;
+                }
                 let l0 = &fused_inputs[li];
                 // Find end of uniform group (same head_dim, kv_heads, window).
                 let mut gi = li + 1;
                 while gi < c.num_hidden_layers {
+                    if is_linear_attn(gi) { break; }
                     let lj = &fused_inputs[gi];
                     if lj.head_dim != l0.head_dim || lj.kv_heads != l0.kv_heads
                         || lj.num_heads != l0.num_heads || lj.window != l0.window
@@ -377,6 +558,7 @@ impl LlamaModel {
                             hidden = forward_layer(
                                 &hidden, i, &self.weights.layers[i], c, &pos_tensor, backend,
                                 &mut self.kv_cache[i], self.past_seq_len, None,
+                                self.gdn_state[i].as_deref_mut(), self.gdn_conv_state[i].as_deref_mut(), None,
                             )?;
                         }
                         li = gi;
@@ -397,6 +579,9 @@ impl LlamaModel {
                     &mut self.kv_cache[i],
                     self.past_seq_len,
                     if prof_enabled { Some(&mut self.prof) } else { None },
+                    self.gdn_state[i].as_deref_mut(),
+                    self.gdn_conv_state[i].as_deref_mut(),
+                    mrope_pos,
                 )?;
                 if debug_layers {
                     let h = hidden.try_as_f32()?;
@@ -404,6 +589,7 @@ impl LlamaModel {
                     let s = (h.iter().map(|v| v * v).sum::<f32>() / h.len() as f32).sqrt();
                     let kind = match c.layer_types.get(i).copied() {
                         Some(crate::arch::decoder::config::LayerKind::Full) => "full",
+                        Some(crate::arch::decoder::config::LayerKind::LinearAttn) => "gdn ",
                         _ => "slid",
                     };
                     eprintln!("layer {i:>3} {kind} abs_max={m:>9.4} rms={s:>8.4}");
@@ -516,6 +702,9 @@ fn forward_layer(
     kv: &mut (Vec<f32>, Vec<f32>),
     past_seq_len: usize,
     prof: Option<&mut ForwardProf>,
+    gdn_state: Option<&mut [f32]>,
+    gdn_conv_state: Option<&mut [f32]>,
+    mrope_pos: Option<[f32; 3]>,
 ) -> Result<Tensor, BackendError> {
     use std::time::Instant;
     let debug_layer = std::env::var("RUN_DEBUG_LAYER_IDX")
@@ -527,14 +716,10 @@ fn forward_layer(
     if debug_l0 {
         dbg_stats_l(layer_idx, "hidden_in (embed)", &backend.download_f32(hidden)?);
     }
-    let hidden_size = config.hidden_size;
-    // LlamaStyle+ (Gemma-4) per-layer dims. LlamaStyle returns the global ones.
-    let head_dim = config.layer_head_dim(layer_idx);
-    let num_heads = config.num_attention_heads;
-    let kv_heads = config.layer_kv_heads(layer_idx);
-    let sliding_window = config.layer_window(layer_idx);
-
-    // accumulator helpers
+    // accumulator helpers — shared by both branches below (the
+    // GatedDeltaNet one only ever touches acc_input_norm/acc_attention/
+    // acc_residual; the rest stay 0.0 for those layers, which is honest,
+    // not a bug — they have no qkv_proj/qk_norm/rope/kv_append/o_proj).
     let mut acc_input_norm = 0f64;
     let mut acc_qkv_proj = 0f64;
     let mut acc_qk_norm = 0f64;
@@ -545,6 +730,153 @@ fn forward_layer(
     let mut acc_post_norm = 0f64;
     let mut acc_ffn = 0f64;
     let mut acc_residual = 0f64;
+    let hidden_size = config.hidden_size;
+    // GatedDeltaNet layers (Qwen3.5/3.8/3-Next "linear_attention") replace
+    // Sdpa entirely and carry different tensors (linear_attn.* rather than
+    // self_attn.*) — the whole Sdpa block below (input_norm+qkv, qk_norm,
+    // RoPE, KV-cache attention) is Sliding/Full-shaped and would silently
+    // run against the wrong weights (or tensors that don't exist) for
+    // this layer kind. Both branches produce `hidden1` — the residual
+    // sum going into the shared FFN epilogue below — from the same
+    // `hidden` and `layer.input_norm`; only what happens in between
+    // differs. Spec: ops.md §"GatedDeltaNet".
+    let is_linear_attn = config.layer_types.get(layer_idx).copied()
+        == Some(crate::arch::decoder::config::LayerKind::LinearAttn);
+    // Set when the fused GatedDeltaNet block also ran this layer's FFN —
+    // the shared epilogue below then skips it.
+    let mut gdn_layer_out: Option<Tensor> = None;
+    let hidden1: Tensor = if is_linear_attn {
+        let t_gdn = Instant::now();
+        let Some(la) = &layer.linear_attn else {
+            return Err(BackendError::Internal(format!(
+                "layer {layer_idx}: layer_types says linear_attention but LayerWeights.linear_attn is None (import/load mismatch)"
+            )));
+        };
+        let Some(state) = gdn_state else {
+            return Err(BackendError::Internal(format!(
+                "layer {layer_idx}: linear_attention layer called without a GatedDeltaNet state buffer"
+            )));
+        };
+        let Some(conv_state) = gdn_conv_state else {
+            return Err(BackendError::Internal(format!(
+                "layer {layer_idx}: linear_attention layer called without a GatedDeltaNet conv_state buffer"
+            )));
+        };
+        let dims = crate::backend::cpu::gated_delta::GatedDeltaDims {
+            num_v_heads: config.linear_num_value_heads.unwrap_or(0),
+            num_k_heads: config.linear_num_key_heads.unwrap_or(0),
+            head_k_dim: config.linear_key_head_dim.unwrap_or(0),
+            head_v_dim: config.linear_value_head_dim.unwrap_or(0),
+            conv_kernel_size: config.linear_conv_kernel_dim.unwrap_or(0),
+        };
+        // Whole block in one GPU command buffer when the backend can
+        // (honeycrisp, Q8 weights, T=1). GDN_FUSED=0 forces the per-op
+        // path; GDN_FUSED_CHECK=1 runs BOTH and prints the per-layer
+        // divergence — the correctness check for the fused kernels on
+        // real weights.
+        let fused_off = std::env::var("GDN_FUSED").map(|v| v == "0").unwrap_or(false);
+        let fused_check = std::env::var("GDN_FUSED_CHECK").is_ok();
+        // Fold the FFN into the same command buffer under exactly the
+        // conditions the shared epilogue's fused_ffn_residual arm accepts.
+        // Not in check mode: the check compares hidden1 (pre-FFN) between
+        // the two paths.
+        let fold_ffn = !fused_check
+            && config.hidden_activation == crate::arch::decoder::config::HiddenActivation::Silu
+            && layer.post_ffw_norm.is_none()
+            && layer.layer_output_scale.is_none()
+            && !debug_l0;
+        let fused_h1 = if fused_off {
+            None
+        } else {
+            let inp = crate::backend::GatedDeltaBlockInput {
+                ffn: if fold_ffn {
+                    Some(crate::backend::GatedDeltaFfnInput {
+                        post_norm: &layer.post_norm,
+                        gate_w: &layer.gate_proj.tensor,
+                        up_w: &layer.up_proj.tensor,
+                        down_w: &layer.down_proj.tensor,
+                    })
+                } else {
+                    None
+                },
+                layer_idx,
+                hidden,
+                input_norm: &layer.input_norm,
+                in_proj_qkv: &la.in_proj_qkv.tensor,
+                in_proj_z: &la.in_proj_z.tensor,
+                in_proj_b: &la.in_proj_b.tensor,
+                in_proj_a: &la.in_proj_a.tensor,
+                out_proj: &la.out_proj.tensor,
+                conv1d_weight: &la.conv1d_weight,
+                a_log: &la.a_log,
+                dt_bias: &la.dt_bias,
+                norm_weight: &la.norm_weight,
+                dims,
+                eps,
+                past_seq_len,
+            };
+            backend.gated_delta_block_fused(&inp, state, conv_state)?
+        };
+        let h1 = match fused_h1 {
+            Some(h1_fused) if !fused_check => h1_fused,
+            fused => {
+                // Per-op path. `in_proj_*`/`out_proj` are quant weights,
+                // GPU-resident after `to_backend()` — `gated_delta_forward`'s
+                // `proj_matmul` dispatches them through `backend.quant_matmul`
+                // directly, no host dequant here. `normed` passes straight
+                // through: on honeycrisp it's a shared-storage buffer, so
+                // `.as_f32()` inside reads it zero-copy.
+                let normed = backend
+                    .execute(&Op::RmsNorm { eps }, &[hidden, &layer.input_norm])?
+                    .remove(0);
+                let weights = crate::backend::cpu::gated_delta::GatedDeltaWeights {
+                    in_proj_qkv: &la.in_proj_qkv.tensor,
+                    in_proj_z: &la.in_proj_z.tensor,
+                    in_proj_b: &la.in_proj_b.tensor,
+                    in_proj_a: &la.in_proj_a.tensor,
+                    conv1d_weight: &la.conv1d_weight,
+                    a_log: &la.a_log,
+                    dt_bias: &la.dt_bias,
+                    norm_weight: &la.norm_weight,
+                    out_proj: &la.out_proj.tensor,
+                };
+                let gdn_out = crate::backend::cpu::gated_delta::gated_delta_forward(
+                    &normed, &weights, dims, eps, state, conv_state, backend,
+                )?;
+                let h1_ref = backend.execute(&Op::Add, &[hidden, &gdn_out])?.remove(0);
+                match fused {
+                    Some(h1_fused) => {
+                        let a = backend.download_f32(&h1_fused)?;
+                        let b = backend.download_f32(&h1_ref)?;
+                        let (mut worst, mut max_ref) = (0f32, 0f32);
+                        for (x, y) in a.iter().zip(b.iter()) {
+                            worst = worst.max((x - y).abs());
+                            max_ref = max_ref.max(y.abs());
+                        }
+                        eprintln!(
+                            "[GDN_FUSED_CHECK] layer {layer_idx:>3} pos {past_seq_len:>4}: worst abs diff {worst:.3e}  max|ref| {max_ref:.3e}  rel {:.3e}",
+                            worst / max_ref.max(1e-12)
+                        );
+                        h1_fused
+                    }
+                    None => h1_ref,
+                }
+            }
+        };
+        acc_attention += t_gdn.elapsed().as_secs_f64() * 1000.0;
+        h1
+    } else {
+    // LlamaStyle+ (Gemma-4) per-layer dims. LlamaStyle returns the global ones.
+    let head_dim = config.layer_head_dim(layer_idx);
+    let num_heads = config.num_attention_heads;
+    let kv_heads = config.layer_kv_heads(layer_idx);
+    let sliding_window = config.layer_window(layer_idx);
+    // Qwen3.5/3.8: q_proj produces Q ++ a per-element attention-output
+    // gate, concatenated (see FamilyProfile::has_attn_output_gate).
+    // Forces the plain per-op matmul path below — `fused_norm_qkv_qknorm`
+    // assumes q_proj's output width is exactly num_heads*head_dim and
+    // would reshape/qk_norm this layer's DOUBLE-width output incorrectly.
+    let is_gated_attn = config.family.has_attn_output_gate;
 
     // 1+2(+optionally qk_norm). For qwen3 (qk_norm + no bias), fuse the WHOLE
     // chain (input_norm + qkv + qk_norm) into ONE command buffer.
@@ -552,7 +884,7 @@ fn forward_layer(
     let no_bias = layer.q_proj_bias.is_none()
         && layer.k_proj_bias.is_none()
         && layer.v_proj_bias.is_none();
-    let (mut q, mut k, mut v, qk_norm_done) = if no_bias {
+    let (mut q, mut k, mut v, qk_norm_done) = if no_bias && !is_gated_attn {
         if let (Some(qn), Some(kn)) = (&layer.q_norm, &layer.k_norm) {
             let (qq, kk, vv) = backend.fused_norm_qkv_qknorm(
                 hidden,
@@ -601,6 +933,33 @@ fn forward_layer(
     }
     acc_qkv_proj += t.elapsed().as_secs_f64() * 1000.0;
 
+    // Qwen3.5/3.8: split q_proj's double-width output into Q (everything
+    // below treats this as "q", unchanged) and the attention-output gate
+    // (held aside, no norm, no RoPE, applied after Sdpa and before
+    // o_proj, see below). PER-HEAD INTERLEAVED, not a global first-half/
+    // second-half split — HF's `q_proj(x).view(..., num_heads,
+    // head_dim*2)` then `chunk(2, dim=-1)` splits the LAST axis of a
+    // `[num_heads, head_dim*2]` view, so each head's raw output row is
+    // `[q(head_dim), gate(head_dim)]` back to back, repeated per head:
+    // `[h0_q, h0_gate, h1_q, h1_gate, ...]`. Getting this wrong (treating
+    // it as `[all_q, all_gate]`) is shape-compatible but numerically
+    // wrong — exactly the kind of bug a shape check can't catch.
+    let attn_gate: Option<Vec<f32>> = if is_gated_attn {
+        let full = q.to_f32_vec();
+        debug_assert_eq!(full.len(), 2 * num_heads * head_dim, "gated q_proj output must be exactly 2x num_heads*head_dim");
+        let mut query_part = vec![0f32; num_heads * head_dim];
+        let mut gate_part = vec![0f32; num_heads * head_dim];
+        for h in 0..num_heads {
+            let src = &full[h * 2 * head_dim..(h + 1) * 2 * head_dim];
+            query_part[h * head_dim..(h + 1) * head_dim].copy_from_slice(&src[..head_dim]);
+            gate_part[h * head_dim..(h + 1) * head_dim].copy_from_slice(&src[head_dim..]);
+        }
+        q = Tensor::from_f32(vec![1, num_heads * head_dim], query_part);
+        Some(gate_part)
+    } else {
+        None
+    };
+
     // QK-norm (Qwen3) — per-head RmsNorm. Batched: ONE command buffer for both.
     // Skipped if already done by fused_norm_qkv_qknorm above.
     let t = Instant::now();
@@ -628,26 +987,55 @@ fn forward_layer(
     let k_shape = vec![kv_heads, head_dim];
     let q_reshaped = Tensor::from_f32(q_shape.clone(), q.to_f32_vec());
     let k_reshaped = Tensor::from_f32(k_shape.clone(), k.to_f32_vec());
-    let q_roped = backend
-        .execute(
-            &Op::Rope {
-                head_dim: head_dim as u32,
-                rope_dim: layer_rope_dim as u32,
-                base: layer_rope_base,
-            },
-            &[&q_reshaped, pos],
-        )?
-        .remove(0);
-    let k_roped = backend
-        .execute(
-            &Op::Rope {
-                head_dim: head_dim as u32,
-                rope_dim: layer_rope_dim as u32,
-                base: layer_rope_base,
-            },
-            &[&k_reshaped, pos],
-        )?
-        .remove(0);
+    // Qwen3.5/3.8 multimodal: interleaved 3D mRoPE replaces the plain
+    // scalar-pos Op::Rope dispatch for full_attention layers — CPU-only
+    // reference path (mrope.rs), same precedent as GatedDeltaNet.
+    // `layer_rope_dim`'s partial-rotary convention (contiguous prefix)
+    // and mrope_cos_sin's frequency-axis split both key off `rope_dim`;
+    // see ops.md §"mRoPE, interleaved" for why this can't reuse
+    // Op::Rope's Gemma-4-shaped math.
+    // mRoPE is a `full_attention`-only mechanism in every family that has
+    // it (Qwen3.5/3.8's `linear_attention` layers already returned above;
+    // a hypothetical future family mixing `Sliding` + mrope_section
+    // would need Sliding to keep plain 1D RoPE) — gate on layer kind
+    // explicitly rather than just "not LinearAttn".
+    let is_full_kind = config.layer_types.get(layer_idx).copied()
+        == Some(crate::arch::decoder::config::LayerKind::Full);
+    let (q_roped, k_roped) = if let (Some(triple), Some(section)) =
+        (mrope_pos.filter(|_| is_full_kind), config.mrope_section)
+    {
+        let (cos, sin) = crate::backend::cpu::mrope::mrope_cos_sin(
+            &[triple], layer_rope_dim, layer_rope_base, section,
+        );
+        // Backend-dispatched — CPU backend runs `apply_rope_cos_sin_f32`
+        // directly (trait default), honeycrisp runs its own Metal kernel
+        // (kernels::mrope) with the SAME contiguous-prefix math.
+        let q_r = backend.apply_mrope_cos_sin(&q_reshaped, &cos, &sin, head_dim, layer_rope_dim)?;
+        let k_r = backend.apply_mrope_cos_sin(&k_reshaped, &cos, &sin, head_dim, layer_rope_dim)?;
+        (q_r, k_r)
+    } else {
+        let q_r = backend
+            .execute(
+                &Op::Rope {
+                    head_dim: head_dim as u32,
+                    rope_dim: layer_rope_dim as u32,
+                    base: layer_rope_base,
+                },
+                &[&q_reshaped, pos],
+            )?
+            .remove(0);
+        let k_r = backend
+            .execute(
+                &Op::Rope {
+                    head_dim: head_dim as u32,
+                    rope_dim: layer_rope_dim as u32,
+                    base: layer_rope_base,
+                },
+                &[&k_reshaped, pos],
+            )?
+            .remove(0);
+        (q_r, k_r)
+    };
     acc_rope += t.elapsed().as_secs_f64() * 1000.0;
 
     if debug_l0 {
@@ -668,8 +1056,12 @@ fn forward_layer(
     // GPU attention path is correct but currently slower in wall clock due to
     // 1 extra batch wait per layer. It's the foundation for cross-layer batching
     // (next step). Off by default — enable with MR_GPU_ATTN=1.
+    // `fused_attn_oproj_residual` runs o_proj internally with no hook to
+    // apply the Qwen3.5/3.8 attention-output gate in between — excluded
+    // until that path learns about it.
     let use_gpu_attn = backend.supports_gpu_attention()
         && !config.family.v_norm_per_head
+        && !is_gated_attn
         && layer.post_attn_norm.is_none()
         && std::env::var("MR_GPU_ATTN").is_ok();
     // Fused attention path returns hidden1 (post-residual) directly,
@@ -787,6 +1179,17 @@ fn forward_layer(
         h1
     } else {
         let t = Instant::now();
+        // Qwen3.5/3.8: attn_output *= sigmoid(gate), BEFORE o_proj — the
+        // gate held aside when q_proj was split above.
+        let attn_tensor = if let Some(gate) = &attn_gate {
+            let mut data = attn_tensor.to_f32_vec();
+            for (v, g) in data.iter_mut().zip(gate.iter()) {
+                *v *= 1.0 / (1.0 + (-g).exp());
+            }
+            Tensor::from_f32(attn_tensor.shape.clone(), data)
+        } else {
+            attn_tensor
+        };
         let mut attn_proj = qw_matmul(&attn_tensor, &layer.o_proj, backend)?;
         if debug_l0 || debug_l1 {
             dbg_stats_l(layer_idx, "o_proj_out", &backend.download_f32(&attn_proj)?);
@@ -806,9 +1209,14 @@ fn forward_layer(
         acc_residual += t.elapsed().as_secs_f64() * 1000.0;
         h1
     };
+        hidden1
+    };
 
     // 8+9. FFN. Try fully fused FFN (norm + gate + up + silu*up + down + residual)
-    // for SiLU; falls back to per-op for other activations.
+    // for SiLU; falls back to per-op for other activations. Shared by both
+    // branches above — FFN is attention-mechanism-agnostic, same weights
+    // and same math whether hidden1 came from Sdpa or GatedDeltaNet.
+    let t = Instant::now();
     use crate::arch::decoder::config::HiddenActivation;
     let mut out_gpu: Option<Tensor> = None;
     let mut ffn_out = match config.hidden_activation {

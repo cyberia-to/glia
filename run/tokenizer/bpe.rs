@@ -22,6 +22,10 @@ pub struct Bpe {
     /// (metaspace) instead of GPT-2 byte-level encoding. Auto-detected by
     /// presence of ▁-prefixed tokens in the vocab.
     metaspace: bool,
+    /// Particle mode (CT-0 / cybergraph compiles): the vocab is whole
+    /// particles (CIDs); each whitespace-delimited word is looked up as
+    /// ONE token — no BPE decomposition. Unknown words are skipped.
+    pub particle: bool,
 }
 
 impl Bpe {
@@ -44,6 +48,7 @@ impl Bpe {
 
         let byte_encoder = byte_level::build_byte_encoder();
         let byte_decoder = byte_level::build_byte_decoder(&byte_encoder);
+        let _ = &byte_decoder;
 
         // Detect special tokens: anything that looks like a control token
         // — angle-bracketed, no whitespace, short. Catches both ChatML/HF
@@ -72,6 +77,7 @@ impl Bpe {
             byte_decoder,
             specials,
             metaspace,
+            particle: false,
         }
     }
 
@@ -95,6 +101,13 @@ impl Bpe {
     ///    apply merges until no more apply, look up in vocab.
     /// 3. Concatenate all resulting IDs.
     pub fn encode(&self, text: &str) -> Vec<u32> {
+        if self.particle {
+            // whole-particle lookup: one token per whitespace word
+            return text
+                .split_whitespace()
+                .filter_map(|w| self.id(w))
+                .collect();
+        }
         let mut out = Vec::new();
         let segments = self.split_on_specials(text);
         for seg in segments {

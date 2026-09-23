@@ -1,5 +1,8 @@
 # Completeness audit (2026-04-17)
 
+Reviewed documents: [runtime specifications](../../run/specs/README.md).
+Bare specification filenames below refer to that directory.
+
 Spec is **architecture-complete** but **operationally incomplete**.
 
 > **UPDATE 2026-04-17 (2):** CRITICAL 1-7 filled. See changelog at bottom.

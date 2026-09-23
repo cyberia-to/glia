@@ -32,8 +32,79 @@ pub struct ModelFile {
     pub vocab_toml: String,
     pub chat_toml: String,
     pub eval_toml: String,
-    /// Binary weights section — may be mmap-backed for large models.
-    pub weights: Vec<u8>,
+    /// Binary weights section — mmap-backed for large models, owned bytes
+    /// for small ones. `Weights::load` reads every tensor's bytes out of
+    /// this exactly once (into its own `QuantWeight`/`Tensor`), so this
+    /// itself staying zero-copy means a large model's weights section
+    /// never has to exist twice in RAM at once during load — see
+    /// `run/specs/gated-delta-vl-plan.md`, "import itself OOMs" (the same
+    /// failure mode, found again here on the runtime's own load path).
+    pub weights: WeightBytes,
+}
+
+/// Either owned bytes (small models, or the frontmatter-only text scan
+/// already covered the whole weights section) or an mmap kept alive for
+/// the file's lifetime (large models) — `get()` hides the difference.
+pub enum WeightBytes {
+    Owned(Vec<u8>),
+    Mapped {
+        mmap: memmap2::Mmap,
+        /// Byte offset within `mmap` where the weights section begins;
+        /// every `TensorMeta::offset` is relative to THIS, not to the
+        /// start of the file.
+        weights_start: usize,
+    },
+}
+
+impl WeightBytes {
+    pub fn get(&self, range: std::ops::Range<usize>) -> Option<&[u8]> {
+        match self {
+            WeightBytes::Owned(v) => v.get(range),
+            WeightBytes::Mapped { mmap, weights_start } => {
+                mmap.get(weights_start + range.start..weights_start + range.end)
+            }
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        match self {
+            WeightBytes::Owned(v) => v.len(),
+            WeightBytes::Mapped { mmap, weights_start } => mmap.len().saturating_sub(*weights_start),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Tell the kernel this byte range's mmap'd pages won't be read
+    /// again — call this right after copying a tensor's bytes out, not
+    /// before (the safety contract on `MADV_DONTNEED` is that nothing
+    /// still borrows the range). Without this, the loader's own reads
+    /// through the mmap accumulate as resident file-backed pages ON TOP
+    /// OF the owned copies each tensor lands in, and macOS does not
+    /// reclaim them fast enough under a sustained sequential-write
+    /// workload to avoid an OOM on a large model — `phys_footprint`
+    /// climbed past the model's own 29.5 GB packed size and kept rising
+    /// before this was added (`gated-delta-vl-plan.md`, "climbs past its
+    /// own honest size"). No-op for `Owned` — nothing mmap'd to drop.
+    /// Best-effort: a failure here costs performance, not correctness.
+    pub fn drop_range(&self, range: std::ops::Range<usize>) {
+        if let WeightBytes::Mapped { mmap, weights_start } = self {
+            // SAFETY: MADV_DONTNEED's contract is that nothing still reads
+            // through this range afterward — true here by construction:
+            // every caller (`tensor_bytes_owned`) copies the bytes out
+            // FIRST and calls this only after that copy exists, never
+            // while a borrow into the mmap is still alive.
+            let _ = unsafe {
+                mmap.unchecked_advise_range(
+                    memmap2::UncheckedAdvice::DontNeed,
+                    weights_start + range.start,
+                    range.len(),
+                )
+            };
+        }
+    }
 }
 
 /// Per-tensor metadata from the tensors section.
@@ -59,21 +130,21 @@ pub fn read_model_file(path: &Path) -> Result<ModelFile, FormatError> {
     let file = std::fs::File::open(path)?;
     let file_len = file.metadata()?.len() as usize;
 
-    // Text header scan: read up to 32 MB to find ~~~weights\n marker.
-    // Gemma-4 has ~18 MB of tensor index.
-    let scan_limit = file_len.min(32 * 1024 * 1024);
-    let mut reader = std::io::BufReader::new(&file);
-    let mut header = vec![0u8; scan_limit];
-    use std::io::Read;
-    reader.read_exact(&mut header)?;
-
+    // Text header scan: find the ~~~weights\n marker. The marker can sit
+    // far into the file — a large vocab section precedes it (the CT-0
+    // compile of bostrom carries ~450 MB of vocab text before weights,
+    // which the old 32 MB read-ahead cap rejected as "no ~~~weights
+    // section"). mmap the whole file and scan it: the marker search is
+    // a single memchr-class pass, and the mmap is reused below for the
+    // large-model zero-copy path either way.
+    let mmap = unsafe { memmap2::Mmap::map(&file)? };
     let marker = b"~~~weights\n";
-    let marker_pos = header
+    let marker_pos = mmap
         .windows(marker.len())
         .position(|w| w == marker)
         .ok_or_else(|| FormatError::Invalid("no ~~~weights section".into()))?;
 
-    let text_part = std::str::from_utf8(&header[..marker_pos])
+    let text_part = std::str::from_utf8(&mmap[..marker_pos])
         .map_err(|e| FormatError::Invalid(format!("non-utf8 text header: {e}")))?;
 
     // Reject pre-canonical files. Frontmatter must declare the canonical
@@ -92,20 +163,18 @@ pub fn read_model_file(path: &Path) -> Result<ModelFile, FormatError> {
     // Parse ~~~sections
     let sections = parse_sections(text_part);
 
-    // Read weights section.
+    // Read weights section. Large files: keep the mmap itself, never copy
+    // the weights blob out whole — a 27B model's ~30 GB packed weights
+    // existed twice at once here (this Vec, then again distributed across
+    // every tensor's own QuantWeight bytes) and peaked at OOM on a 48 GB
+    // Mac before generation ever started. `WeightBytes::get` makes the
+    // two branches look identical to every caller.
     let weights_start = marker_pos + marker.len();
     let weights_end = (weights_start + weights_size).min(file_len);
     let weights = if file_len > 1_000_000_000 {
-        // mmap for large files
-        drop(reader);
-        let mmap = unsafe { memmap2::Mmap::map(&file)? };
-        mmap[weights_start..weights_end].to_vec()
-    } else if weights_end <= header.len() {
-        header[weights_start..weights_end].to_vec()
+        WeightBytes::Mapped { mmap, weights_start }
     } else {
-        drop(reader);
-        let data = std::fs::read(path)?;
-        data[weights_start..weights_end].to_vec()
+        WeightBytes::Owned(mmap[weights_start..weights_end].to_vec())
     };
 
     // Decode the optional hex-encoded graph section.
@@ -264,5 +333,21 @@ impl LoadedModel {
         let start = meta.offset as usize;
         let end = start + meta.size as usize;
         self.file.weights.get(start..end)
+    }
+
+    /// Copy one tensor's bytes out and immediately advise the kernel
+    /// that its source pages (mmap-backed models only) won't be read
+    /// again. Every loader that will hold its own copy for the model's
+    /// lifetime anyway (`load_quant_weight`, `load_tensor_f32`) should
+    /// use this instead of `tensor_bytes(name).to_vec()` — see
+    /// `WeightBytes::drop_range`'s doc for why the difference matters
+    /// on a large model.
+    pub fn tensor_bytes_owned(&self, name: &str) -> Option<Vec<u8>> {
+        let meta = self.tensors.iter().find(|t| t.name == name)?;
+        let start = meta.offset as usize;
+        let end = start + meta.size as usize;
+        let bytes = self.file.weights.get(start..end)?.to_vec();
+        self.file.weights.drop_range(start..end);
+        Some(bytes)
     }
 }

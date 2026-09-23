@@ -34,7 +34,16 @@ pub fn build_tokenizer(lm: &LoadedModel) -> Result<Tokenizer, FormatError> {
     // them from config.
     inject_missing_specials(&mut tokens, &cfg, &eos_token_ids);
 
-    let bpe = Bpe::new(tokens, merges);
+    let mut bpe = Bpe::new(tokens, merges);
+    // particle tokenizers (CT-0 cybergraph compiles): [tokenizer]
+    // type = "particle" — whole-word CID lookup, no BPE.
+    let particle = cfg
+        .get("tokenizer")
+        .and_then(|t| t.get("type"))
+        .and_then(|v| v.as_str())
+        .map(|s| s == "particle")
+        .unwrap_or(false);
+    bpe.particle = particle;
 
     // Architectural turn-boundary aliases. If the model uses chat turn
     // markers that aren't already in eos_token_ids, add them so generate()
