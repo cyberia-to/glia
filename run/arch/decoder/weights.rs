@@ -557,6 +557,38 @@ fn load_layer(
         let in_rms = (in_vals.iter().map(|v|v*v).sum::<f32>() / in_vals.len() as f32).sqrt();
         eprintln!("  layer0 input_norm abs_max={in_m:.4} rms={in_rms:.4} len={}", in_vals.len());
     }
+    // MLP: CT-0 compiles ship the Clifford MLP (spec §8) as a quiet
+    // training substrate, not the SwiGLU trio — their `mlp.*` tensors
+    // are absent. A zeroed SwiGLU is an EXACT no-op (silu(0)·0 ↓ 0), so
+    // absent tensors synthesize zeros instead of failing the load; a
+    // PRESENT tensor still loads with full shape checking.
+    let zero_qw = |n: usize, k: usize| {
+        let shape = vec![n, k];
+        let bytes = vec![0u8; n * k * 4];
+        QuantWeight {
+            shape: shape.clone(),
+            dtype: crate::core::dtype::DType::F32,
+            bytes: Arc::new(bytes.clone()),
+            tensor: Tensor::from_bytes(shape, crate::core::dtype::DType::F32, bytes),
+        }
+    };
+    let has_mlp = lm
+        .tensors
+        .iter()
+        .any(|t| t.name == format!("{prefix}.mlp.gate_proj.weight"));
+    let (gate_proj, up_proj, down_proj) = if has_mlp {
+        (
+            quant_nk("mlp.gate_proj.weight", intermediate, hidden)?,
+            quant_nk("mlp.up_proj.weight", intermediate, hidden)?,
+            quant_nk("mlp.down_proj.weight", hidden, intermediate)?,
+        )
+    } else {
+        (
+            zero_qw(intermediate, hidden),
+            zero_qw(intermediate, hidden),
+            zero_qw(hidden, intermediate),
+        )
+    };
     Ok(LayerWeights {
         input_norm: must_f32("input_layernorm.weight")?,
         q_proj,
@@ -569,9 +601,9 @@ fn load_layer(
         q_norm: try_load_f32("self_attn.q_norm.weight"),
         k_norm: try_load_f32("self_attn.k_norm.weight"),
         post_norm: must_f32("post_attention_layernorm.weight")?,
-        gate_proj: quant_nk("mlp.gate_proj.weight", intermediate, hidden)?,
-        up_proj: quant_nk("mlp.up_proj.weight", intermediate, hidden)?,
-        down_proj: quant_nk("mlp.down_proj.weight", hidden, intermediate)?,
+        gate_proj,
+        up_proj,
+        down_proj,
         post_attn_norm: try_load_f32("post_attention_norm.weight"),
         post_ffw_norm: try_load_f32("post_ffw_norm.weight"),
         layer_output_scale: try_load_f32("layer_output_scale.weight"),
