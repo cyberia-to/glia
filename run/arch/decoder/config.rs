@@ -251,6 +251,16 @@ impl LlamaConfig {
         if num_hidden_layers == 0 {
             return Err(FormatError::Invalid("num_hidden_layers must be > 0".into()));
         }
+        // Bounded well above any real model (the largest known LLMs run a
+        // few hundred layers) so a corrupted or adversarial config.toml
+        // can't drive `vec![LayerKind::Sliding; num_hidden_layers]` a few
+        // lines below, and every per-layer Vec::with_capacity downstream in
+        // the loader, to try to allocate an attacker-chosen amount of memory.
+        if num_hidden_layers > 4096 {
+            return Err(FormatError::Invalid(format!(
+                "num_hidden_layers too large: {num_hidden_layers}"
+            )));
+        }
         if vocab_size == 0 {
             return Err(FormatError::Invalid("vocab_size must be > 0".into()));
         }
@@ -381,5 +391,47 @@ impl LlamaConfig {
             query_pre_attn_scalar,
             family,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LlamaConfig;
+
+    const MINIMAL: &str = r#"
+        [architecture]
+        hidden_size = 64
+        num_attention_heads = 4
+        num_hidden_layers = 2
+        intermediate_size = 128
+        vocab_size = 100
+        head_dim = 16
+    "#;
+
+    #[test]
+    fn parses_a_well_formed_config() {
+        let config = LlamaConfig::parse(MINIMAL, &[]).unwrap();
+        assert_eq!(config.num_hidden_layers, 2);
+        assert_eq!(config.layer_types.len(), 2);
+    }
+
+    #[test]
+    fn rejects_oversized_num_hidden_layers_instead_of_allocating() {
+        let toml = MINIMAL.replace("num_hidden_layers = 2", "num_hidden_layers = 999999999999");
+        let err = match LlamaConfig::parse(&toml, &[]) {
+            Err(e) => format!("{e:?}"),
+            Ok(_) => panic!("expected an error"),
+        };
+        assert!(err.contains("too large"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn still_rejects_zero_num_hidden_layers() {
+        let toml = MINIMAL.replace("num_hidden_layers = 2", "num_hidden_layers = 0");
+        let err = match LlamaConfig::parse(&toml, &[]) {
+            Err(e) => format!("{e:?}"),
+            Ok(_) => panic!("expected an error"),
+        };
+        assert!(err.contains("must be > 0"), "unexpected error: {err}");
     }
 }
