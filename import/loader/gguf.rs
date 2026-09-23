@@ -231,10 +231,16 @@ fn parse_gguf_header(
     }
 
     // Read tensor info entries
-    let mut tensor_infos = Vec::with_capacity(tensor_count as usize);
+    if tensor_count > 10_000_000 {
+        return Err(format!("GGUF tensor count too large: {tensor_count}"));
+    }
+    let mut tensor_infos = Vec::with_capacity((tensor_count as usize).min(1_000_000));
     for _ in 0..tensor_count {
         let name = read_gguf_string(&mut cursor)?;
         let n_dims = read_u32(&mut cursor)?;
+        if n_dims > 8 {
+            return Err(format!("GGUF tensor {name:?} has too many dimensions: {n_dims}"));
+        }
         let mut dims = Vec::with_capacity(n_dims as usize);
         for _ in 0..n_dims {
             dims.push(read_u64(&mut cursor)?);
@@ -582,5 +588,56 @@ fn read_gguf_value_typed(cursor: &mut Cursor<&[u8]>, value_type: u32) -> Result<
             log::warn!("Unknown GGUF value type: {value_type} at position {}", cursor.position());
             Err(format!("Unknown GGUF value type: {value_type}"))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_gguf_header;
+
+    fn header(tensor_count: u64, metadata_kv_count: u64) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"GGUF");
+        buf.extend_from_slice(&3u32.to_le_bytes()); // version 3 -> u64 counts
+        buf.extend_from_slice(&tensor_count.to_le_bytes());
+        buf.extend_from_slice(&metadata_kv_count.to_le_bytes());
+        buf
+    }
+
+    #[test]
+    fn rejects_oversized_tensor_count_instead_of_allocating() {
+        let buf = header(u64::MAX, 0);
+        let err = match parse_gguf_header(&buf) {
+            Err(e) => e,
+            Ok(_) => panic!("expected an error"),
+        };
+        assert!(err.contains("tensor count too large"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn rejects_oversized_n_dims_instead_of_allocating() {
+        let mut buf = header(1, 0);
+        buf.extend_from_slice(&0u64.to_le_bytes()); // tensor name: empty string
+        buf.extend_from_slice(&u32::MAX.to_le_bytes()); // n_dims: malicious
+        let err = match parse_gguf_header(&buf) {
+            Err(e) => e,
+            Ok(_) => panic!("expected an error"),
+        };
+        assert!(err.contains("too many dimensions"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn accepts_a_well_formed_tensor_entry() {
+        let mut buf = header(1, 0);
+        buf.extend_from_slice(&0u64.to_le_bytes()); // tensor name: empty string
+        buf.extend_from_slice(&2u32.to_le_bytes()); // n_dims
+        buf.extend_from_slice(&4u64.to_le_bytes()); // dim 0
+        buf.extend_from_slice(&8u64.to_le_bytes()); // dim 1
+        buf.extend_from_slice(&0u32.to_le_bytes()); // type_id
+        buf.extend_from_slice(&0u64.to_le_bytes()); // offset
+        let (_, tensor_infos, header_end) = parse_gguf_header(&buf).unwrap();
+        assert_eq!(tensor_infos.len(), 1);
+        assert_eq!(tensor_infos[0].dims, vec![4, 8]);
+        assert_eq!(header_end, buf.len());
     }
 }
