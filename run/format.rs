@@ -60,16 +60,20 @@ impl WeightBytes {
     pub fn get(&self, range: std::ops::Range<usize>) -> Option<&[u8]> {
         match self {
             WeightBytes::Owned(v) => v.get(range),
-            WeightBytes::Mapped { mmap, weights_start } => {
-                mmap.get(weights_start + range.start..weights_start + range.end)
-            }
+            WeightBytes::Mapped {
+                mmap,
+                weights_start,
+            } => mmap.get(weights_start + range.start..weights_start + range.end),
         }
     }
 
     pub fn len(&self) -> usize {
         match self {
             WeightBytes::Owned(v) => v.len(),
-            WeightBytes::Mapped { mmap, weights_start } => mmap.len().saturating_sub(*weights_start),
+            WeightBytes::Mapped {
+                mmap,
+                weights_start,
+            } => mmap.len().saturating_sub(*weights_start),
         }
     }
 
@@ -90,19 +94,33 @@ impl WeightBytes {
     /// own honest size"). No-op for `Owned` — nothing mmap'd to drop.
     /// Best-effort: a failure here costs performance, not correctness.
     pub fn drop_range(&self, range: std::ops::Range<usize>) {
-        if let WeightBytes::Mapped { mmap, weights_start } = self {
-            // SAFETY: MADV_DONTNEED's contract is that nothing still reads
-            // through this range afterward — true here by construction:
-            // every caller (`tensor_bytes_owned`) copies the bytes out
-            // FIRST and calls this only after that copy exists, never
-            // while a borrow into the mmap is still alive.
-            let _ = unsafe {
-                mmap.unchecked_advise_range(
-                    memmap2::UncheckedAdvice::DontNeed,
-                    weights_start + range.start,
-                    range.len(),
-                )
-            };
+        if let WeightBytes::Mapped {
+            mmap,
+            weights_start,
+        } = self
+        {
+            // MADV_DONTNEED is a Unix mmap hint. memmap2's UncheckedAdvice
+            // is cfg(unix) only; on Windows the copy already owns the
+            // bytes and the mapping is best-effort to drop.
+            #[cfg(unix)]
+            {
+                // SAFETY: MADV_DONTNEED's contract is that nothing still reads
+                // through this range afterward — true here by construction:
+                // every caller (`tensor_bytes_owned`) copies the bytes out
+                // FIRST and calls this only after that copy exists, never
+                // while a borrow into the mmap is still alive.
+                let _ = unsafe {
+                    mmap.unchecked_advise_range(
+                        memmap2::UncheckedAdvice::DontNeed,
+                        weights_start + range.start,
+                        range.len(),
+                    )
+                };
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = (mmap, weights_start, range);
+            }
         }
     }
 }
@@ -172,7 +190,10 @@ pub fn read_model_file(path: &Path) -> Result<ModelFile, FormatError> {
     let weights_start = marker_pos + marker.len();
     let weights_end = (weights_start + weights_size).min(file_len);
     let weights = if file_len > 1_000_000_000 {
-        WeightBytes::Mapped { mmap, weights_start }
+        WeightBytes::Mapped {
+            mmap,
+            weights_start,
+        }
     } else {
         WeightBytes::Owned(mmap[weights_start..weights_end].to_vec())
     };
@@ -259,17 +280,17 @@ fn parse_sections(text: &str) -> HashMap<String, String> {
 
 /// Parse the tensors section (TOML) into a list of TensorMeta.
 pub fn parse_tensors_toml(toml_str: &str) -> Result<Vec<TensorMeta>, FormatError> {
-    let value: toml::Value = toml::from_str(toml_str)
-        .map_err(|e| FormatError::Invalid(format!("tensors.toml: {e}")))?;
+    let value: toml::Value =
+        toml::from_str(toml_str).map_err(|e| FormatError::Invalid(format!("tensors.toml: {e}")))?;
     let table = value
         .as_table()
         .ok_or_else(|| FormatError::Invalid("tensors.toml: root is not table".into()))?;
 
     let mut out = Vec::with_capacity(table.len());
     for (name, entry) in table {
-        let t = entry.as_table().ok_or_else(|| {
-            FormatError::Invalid(format!("tensors.toml: {name} is not table"))
-        })?;
+        let t = entry
+            .as_table()
+            .ok_or_else(|| FormatError::Invalid(format!("tensors.toml: {name} is not table")))?;
         let shape: Vec<usize> = t
             .get("shape")
             .and_then(|v| v.as_array())
