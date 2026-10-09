@@ -33,13 +33,13 @@ Both produce a probability distribution over elements. Both are differentiable. 
 | attention | softmax over tokens | tri-kernel over particles |
 | training | offline gradient descent | continuous economic signal (focus) |
 | update | retrain or fine-tune | new cyberlinks enter $\phi^*$ immediately |
-| inference proof | impossible | zero-cost (proof-carrying) |
+| inference proof | impossible | proof-carrying (one zheng proof per step) |
 | explainability | opaque | decomposable (D + S + H contributions) |
 | multi-agent | single model | native ($N$ neurons, foculus consensus) |
 | privacy | model is public or private | individual links private, aggregate public |
 | scale | $O(\text{params})$ per query | $O(\text{relevant\_edges})$ per query |
 | temperature | softmax $\tau$ | Boltzmann $T$ (same math, economic grounding) |
-| light client | download full model | 240-byte checkpoint, verify everything |
+| light client | download full model | one checkpoint (state root + decider proof, goal ≤ 64 KB), verify everything |
 
 Deep Equilibrium Models (Bai et al., 2019) showed that iterating a transformer layer to convergence reaches the same fixed point regardless of initialization. That fixed point is $\phi^*$ restricted to the context. So $L$ transformer layers = $L$ steps of tri-kernel diffusion toward the fixed point.
 
@@ -87,7 +87,7 @@ $T \to 0$: deterministic -- always pick the highest-$\phi^*$ particle (argmax). 
 
 ---
 
-## Zero-Cost Proof-Carrying
+## Proof-Carrying
 
 Every generation step is verifiable:
 
@@ -96,11 +96,13 @@ input:   context particles + query
 compute: tri-kernel iteration (nox<Goldilocks>)
 output:  response particles + zheng proof
 
-verification: 10-50 us (one decider call)
+verification: one zheng verification (goal ≤ 1 ms; measured today 7.96 ms
+              for the small hash.tri fixture, zheng audit/succinct-profile-2026-10.md;
+              for a tri-kernel step TODO(F-numbers))
 proves:       "the tri-kernel was run correctly on this context"
 ```
 
-A transformer cannot prove its inference was correct without re-running it. The cybergraph model produces a proof of correct inference as a byproduct of the computation -- zero additional cost.
+A transformer cannot prove its inference was correct without re-running it. The cybergraph model produces a proof of correct inference alongside the computation; the verifier never re-runs it. proving is extra work for the prover, not free: its cost for a tri-kernel step is not yet measured.
 
 ---
 
@@ -120,7 +122,7 @@ The graph that the model runs on IS the authenticated state. Particles are the v
 
 Open vocabulary without retraining. A transformer's vocabulary is fixed at training time. The cybergraph's vocabulary is the set of all particles -- content-addressed and open. A new particle enters the graph when a neuron creates a cyberlink to it. No retraining, no fine-tuning. The new particle immediately participates in $\phi^*$ computation.
 
-Provable inference. Every generation step carries a STARK proof. Verification takes microseconds. No need to re-run the computation.
+Provable inference. Every generation step carries a zheng proof (hash-only, post-quantum; not a STARK). Verification is one proof check, goal ≤ 1 ms. No need to re-run the computation.
 
 Continuous learning from economic signal. Every cyberlink is a training sample. Every focus expenditure is a gradient signal. The model updates continuously.
 
