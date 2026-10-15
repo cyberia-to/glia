@@ -19,6 +19,7 @@ pub fn run(args: Vec<String>) {
     let mut backend_name: String = "auto".into();
     let mut use_chat = true;
     let mut force_graph = false;
+    let mut image_path: Option<String> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -29,6 +30,7 @@ pub fn run(args: Vec<String>) {
             "--backend"     => { i += 1; backend_name = args[i].clone(); }
             "--no-chat"     => use_chat = false,
             "--path=graph"  => force_graph = true,
+            "--image"       => { i += 1; image_path = Some(args[i].clone()); }
             other => { eprintln!("unknown flag: {other}"); std::process::exit(2); }
         }
         i += 1;
@@ -46,6 +48,56 @@ pub fn run(args: Vec<String>) {
     let tok = build_tokenizer(&lm).unwrap_or_else(|e| { eprintln!("tokenizer build failed: {e}"); std::process::exit(1); });
 
     let backend: Box<dyn Backend> = pick_backend(&backend_name);
+
+    // Multimodal path: needs the concrete LlamaModel (TokenOverride /
+    // forward_ex aren't part of the generic ModelRunner trait), so this
+    // bypasses the curated/graph dispatch below entirely and returns
+    // early. See run/multimodal.rs's module doc for the placeholder-
+    // placement scope note.
+    if let Some(img_path) = &image_path {
+        let mut m = LlamaModel::from_loaded(&lm).unwrap_or_else(|e| {
+            eprintln!("--image requires the curated model path, which failed to load: {e}");
+            std::process::exit(1);
+        });
+        if m.config.vision.is_none() {
+            eprintln!("model '{}' has no vision tower (not a VL checkpoint)", path.display());
+            std::process::exit(1);
+        }
+        if let Err(e) = m.to_backend(&*backend) {
+            eprintln!("weight upload failed: {e}");
+        }
+        println!(
+            "Loaded in {:.1}s  [{}, vision tower present]",
+            t_load.elapsed().as_secs_f64(), m.config.model_type,
+        );
+        println!("Backend: {}", backend.kind().as_str());
+
+        let image_bytes = std::fs::read(img_path).unwrap_or_else(|e| {
+            eprintln!("failed to read image {img_path}: {e}"); std::process::exit(1);
+        });
+        let final_prompt = if use_chat {
+            tok.apply_chat_template(&[ChatMessage { role: "user".into(), content: prompt.clone() }], true)
+        } else {
+            prompt.clone()
+        };
+        let cfg = SampleConfig {
+            method: if temperature <= 0.0 { SampleKind::Greedy } else { SampleKind::TopP },
+            temperature: if temperature <= 0.0 { 1.0 } else { temperature },
+            top_p: 0.95,
+            top_k: 40,
+        };
+        println!("---\n{final_prompt}\n---");
+        let t_gen = Instant::now();
+        match run::multimodal::generate_multimodal(&mut m, &tok, &*backend, &final_prompt, &image_bytes, max_tokens, cfg) {
+            Ok((text, count)) => {
+                let dt = t_gen.elapsed().as_secs_f64();
+                println!("{text}\n---");
+                println!("Generated {count} tokens in {dt:.1}s ({:.1} tok/s)", count as f64 / dt);
+            }
+            Err(e) => { eprintln!("generate_multimodal failed: {e}"); std::process::exit(1); }
+        }
+        return;
+    }
 
     // Dispatch: curated (LlamaModel) → graph (GraphRunner) → error.
     // --path=graph was already parsed above.

@@ -20,8 +20,9 @@ is a spec bug — fix spec first, then code.
 - [format.md](format.md) — .model file layout, tensor index, sections
 - [execution.md](execution.md) — backend contract, dispatch rules, fused op policy
 - [test.md](test.md) — four-tier test strategy: import, op, layer, e2e
-- [reality.md](reality.md) — what actually runs today (5/26), gap analysis
-- [gaps.md](gaps.md) — completeness audit: what's missing for reimplementation
+
+Implementation results and completeness reviews are indexed separately in
+[audit](../../audit/README.md).
 
 ## Source of truth
 

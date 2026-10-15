@@ -29,5 +29,6 @@ pub fn profile() -> FamilyProfile {
         scaled_embeddings: true,
         v_norm_per_head: true,
         attn_scale: AttnScale::Unity,
+        has_attn_output_gate: false,
     }
 }

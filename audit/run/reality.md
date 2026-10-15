@@ -1,5 +1,7 @@
 # Reality check (2026-04-24)
 
+Runtime contract: [run/specs](../../run/specs/README.md).
+
 What runs today vs what the spec targets. Updated each session.
 
 ## Manifest models (in-scope for run/)

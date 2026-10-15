@@ -16,5 +16,5 @@ mod forward;
 mod weights;
 
 pub use config::LlamaConfig;
-pub use forward::LlamaModel;
+pub use forward::{LlamaModel, TokenOverride};
 pub use weights::LayerWeights;

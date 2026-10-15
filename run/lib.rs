@@ -13,6 +13,8 @@ pub mod bench;
 pub mod core;
 pub mod format;
 pub mod generate;
+pub mod multimodal;
+pub mod vision_preprocess;
 pub mod ir;
 pub mod manifest;
 pub mod tokenizer;

@@ -24,5 +24,6 @@ pub fn profile(query_pre_attn_scalar: Option<usize>) -> FamilyProfile {
         scaled_embeddings: true,
         v_norm_per_head: false,
         attn_scale: AttnScale::FixedDivisor(query_pre_attn_scalar.unwrap_or(256)),
+        has_attn_output_gate: false,
     }
 }

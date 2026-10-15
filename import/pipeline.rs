@@ -1,0 +1,757 @@
+//! The import pipeline as a library: snapshot directory in, `.model` out.
+//!
+//! This is `mi import`, callable. It exists because a body that can download
+//! its own weights (cyb's models world) needs the conversion as a function,
+//! not a binary it hopes is on PATH. `mi` calls this too — one pipeline,
+//! two doors.
+
+use std::io::Write as _;
+
+/// Where the packing loop reads a tensor's bytes from. Safetensors sources
+/// go through [`crate::loader::safetensors::LazySafetensors`] so a 27B
+/// model's ~55 GB never sits fully in the heap at once (see
+/// `run/specs/gated-delta-vl-plan.md`, "import itself OOMs") — one
+/// tensor's bytes are copied out of its shard's mmap, packed, written,
+/// and dropped before the next tensor is touched. GGUF/ONNX sources keep
+/// the older eager path; `take` still frees each entry as it's consumed,
+/// which costs nothing extra and helps large GGUF sources for free.
+enum Source {
+    Eager(crate::types::Weights),
+    Lazy(crate::loader::safetensors::LazySafetensors),
+}
+
+impl Source {
+    fn names(&self) -> Vec<String> {
+        match self {
+            Source::Eager(w) => w.weights.keys().cloned().collect(),
+            Source::Lazy(l) => l.names(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Source::Eager(w) => w.len(),
+            Source::Lazy(l) => l.names().len(),
+        }
+    }
+
+    fn dtype_of(&self, name: &str) -> Option<crate::types::DType> {
+        match self {
+            Source::Eager(w) => w.weights.get(name).map(|t| t.dtype),
+            Source::Lazy(l) => l.dtype_shape(name).map(|(d, _)| d),
+        }
+    }
+
+    /// Take this tensor's bytes, freeing them from wherever they were held.
+    fn take(&mut self, name: &str) -> Option<crate::types::Weight> {
+        match self {
+            Source::Eager(w) => w.weights.remove(name),
+            Source::Lazy(l) => l.read(name),
+        }
+    }
+}
+
+/// Convert a snapshot directory (weights + tokenizer.json + config.json) to
+/// a canonical `.model` in the models directory, named `<output_name>.model`.
+/// Returns the written path.
+pub fn import_snapshot(
+    dir_path: &str,
+    output_name: &str,
+) -> Result<std::path::PathBuf, String> {
+    let dir = std::path::Path::new(dir_path);
+    if !dir.is_dir() {
+        return Err(format!(
+            "expected a directory with weights + tokenizer.json + config.json: {dir_path}"
+        ));
+    }
+
+    // Locate the weights artifact. Priority safetensors > GGUF > ONNX,
+    // matching the hf.md fetch contract. The loader auto-detects format.
+    let entries: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+        .ok()
+        .map(|es| es.flatten().map(|e| e.path()).collect())
+        .unwrap_or_default();
+    let ext_eq = |p: &std::path::Path, want: &str| {
+        p.extension()
+            .and_then(|x| x.to_str())
+            .map(|x| x == want)
+            .unwrap_or(false)
+    };
+    let safetensors_files: Vec<_> = entries
+        .iter()
+        .filter(|p| ext_eq(p, "safetensors"))
+        .cloned()
+        .collect();
+    let gguf_files: Vec<_> = entries
+        .iter()
+        .filter(|p| ext_eq(p, "gguf"))
+        .cloned()
+        .collect();
+    let onnx_files: Vec<_> = entries
+        .iter()
+        .filter(|p| ext_eq(p, "onnx"))
+        .cloned()
+        .collect();
+
+    let gguf_path = if !safetensors_files.is_empty() {
+        // Sharded safetensors: pick any shard; the loader follows the index.
+        // Single-file: just one entry.
+        let path = safetensors_files[0].clone();
+        println!("Source: safetensors — {}", path.display());
+        path
+    } else if gguf_files.len() == 1 {
+        let path = gguf_files.into_iter().next().unwrap();
+        println!("Source: GGUF — {}", path.display());
+        path
+    } else if gguf_files.len() > 1 {
+        return Err(format!(
+            "expected one .gguf in {}, found {}",
+            dir.display(),
+            gguf_files.len()
+        ));
+    } else if !onnx_files.is_empty() {
+        let path = onnx_files.into_iter().next().unwrap();
+        println!("Source: ONNX — {}", path.display());
+        path
+    } else {
+        return Err(format!(
+            "no model artifact found in {} (looked for safetensors / gguf / onnx)",
+            dir.display()
+        ));
+    };
+
+    let t_load = std::time::Instant::now();
+    let is_safetensors_source = ext_eq(&gguf_path, "safetensors");
+    let mut weights = if is_safetensors_source {
+        Source::Lazy(
+            crate::loader::safetensors::open_lazy(&gguf_path)
+                .map_err(|e| format!("weights index failed: {e}"))?,
+        )
+    } else {
+        Source::Eager(
+            crate::loader::load_model(&gguf_path).map_err(|e| format!("weights load failed: {e}"))?,
+        )
+    };
+    println!(
+        "{} {} tensors in {:.1}s",
+        if is_safetensors_source { "Indexed" } else { "Loaded" },
+        weights.len(),
+        t_load.elapsed().as_secs_f64()
+    );
+
+    // config.json → config.toml
+    let config_json_path = dir.join("config.json");
+    let config_json: serde_json::Value = if config_json_path.exists() {
+        let s = std::fs::read_to_string(&config_json_path)
+            .map_err(|e| format!("read config.json: {e}"))?;
+        serde_json::from_str(&s).map_err(|e| format!("parse config.json: {e}"))?
+    } else {
+        return Err("no config.json in the snapshot".into());
+    };
+    let text_config = config_json.get("text_config").unwrap_or(&config_json);
+    let model_type = config_json
+        .get("model_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+
+    let tok_config_path = dir.join("tokenizer_config.json");
+    let eos_token_str = if tok_config_path.exists() {
+        let tc = std::fs::read_to_string(&tok_config_path).unwrap_or_default();
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&tc) {
+            v.get("eos_token")
+                .and_then(|t| {
+                    t.as_str().map(|s| s.to_string()).or_else(|| {
+                        t.get("content")
+                            .and_then(|c| c.as_str())
+                            .map(|s| s.to_string())
+                    })
+                })
+                .unwrap_or_default()
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
+    };
+
+    let hidden_size = text_config["hidden_size"].as_u64().unwrap_or(0);
+    let num_heads = text_config["num_attention_heads"].as_u64().unwrap_or(0);
+    let kv_heads = text_config["num_key_value_heads"]
+        .as_u64()
+        .unwrap_or(num_heads);
+    let num_layers = text_config["num_hidden_layers"].as_u64().unwrap_or(0);
+    let intermediate_size = text_config["intermediate_size"].as_u64().unwrap_or(0);
+    let vocab_size = text_config["vocab_size"].as_u64().unwrap_or(0);
+    let head_dim = text_config["head_dim"]
+        .as_u64()
+        .unwrap_or(hidden_size / num_heads.max(1));
+    let max_pos = text_config["max_position_embeddings"]
+        .as_u64()
+        .unwrap_or(8192);
+    // Per-kind RoPE (Gemma-4): rope_parameters.{full_attention, sliding_attention}.
+    // Flat rope_theta is the LlamaStyle / Gemma-3 case; the nested form
+    // extracts sliding's theta here and full's theta+partial_rotary later.
+    //
+    // Qwen3.5/3.8 is a THIRD shape: rope_parameters is itself flat (no
+    // full_attention/sliding_attention sub-keys) but still carries
+    // rope_theta/partial_rotary_factor that apply to whichever layer kind
+    // actually calls RoPE — for this family that's `full_attention`
+    // (Sdpa) only, since `linear_attention` (GatedDeltaNet) layers never
+    // rotate at all. Route this flat dict's values into the SAME
+    // `_full` fields Gemma-4 uses, so `layer_rope_theta`/`layer_rope_dim`
+    // apply them correctly without a third code path. Missing this
+    // (pre-2026-09-12) silently ran Qwen3.8's full_attention layers with
+    // rope_theta=10000 and full head_dim rotation instead of the real
+    // 10_000_000 / 64-of-256 partial rotary — wrong numbers, no crash.
+    let rope_params = text_config.get("rope_parameters");
+    let rope_sliding = rope_params.and_then(|p| p.get("sliding_attention"));
+    let rope_full = rope_params.and_then(|p| p.get("full_attention"));
+    let rope_flat = rope_params.filter(|p| {
+        p.get("sliding_attention").is_none() && p.get("full_attention").is_none()
+    });
+    let rope_theta = rope_sliding
+        .and_then(|s| s.get("rope_theta"))
+        .and_then(|v| v.as_f64())
+        .or_else(|| text_config["rope_theta"].as_f64())
+        .or_else(|| rope_flat.and_then(|p| p.get("rope_theta")).and_then(|v| v.as_f64()))
+        .unwrap_or(10000.0);
+    let rope_theta_full = rope_full
+        .and_then(|f| f.get("rope_theta"))
+        .and_then(|v| v.as_f64())
+        .or_else(|| rope_flat.and_then(|p| p.get("rope_theta")).and_then(|v| v.as_f64()));
+    let partial_rotary_factor_full = rope_full
+        .and_then(|f| f.get("partial_rotary_factor"))
+        .and_then(|v| v.as_f64())
+        .or_else(|| {
+            rope_flat
+                .and_then(|p| p.get("partial_rotary_factor"))
+                .and_then(|v| v.as_f64())
+        })
+        .or_else(|| text_config["partial_rotary_factor"].as_f64());
+    // Qwen3.5/3.8 interleaved mRoPE axis split (spec: ops.md §"mRoPE,
+    // interleaved"). Absent everywhere else.
+    let mrope_section: Option<Vec<u64>> = rope_flat
+        .and_then(|p| p.get("mrope_section"))
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_u64()).collect());
+
+    // Native VL (Qwen3.5/3.8): vision tower config + fusion IDs live on
+    // the OUTER config (sibling of text_config), not inside it. Spec:
+    // ops.md §"VisionTower". Absent entirely for text-only models.
+    let vision_config = config_json.get("vision_config");
+    let vision_rope_theta = vision_config
+        .and_then(|v| v.get("rope_parameters"))
+        .and_then(|r| r.get("rope_theta"))
+        .and_then(|v| v.as_f64())
+        .unwrap_or(10000.0);
+    let image_token_id = config_json["image_token_id"].as_u64();
+    let video_token_id = config_json["video_token_id"].as_u64();
+    let vision_start_token_id = config_json["vision_start_token_id"].as_u64();
+    let vision_end_token_id = config_json["vision_end_token_id"].as_u64();
+
+    let rms_norm_eps = text_config["rms_norm_eps"].as_f64().unwrap_or(1e-6);
+    let tie_word_embeddings = text_config["tie_word_embeddings"]
+        .as_bool()
+        .or_else(|| config_json["tie_word_embeddings"].as_bool())
+        .unwrap_or(true);
+
+    // LlamaStyle+ (Gemma 3/4) optional fields. Each is omitted from the
+    // config when absent so plain LlamaStyle models stay clean.
+    // Spec: run/specs/format.md §"LlamaStyle+ extra fields"
+    let hidden_activation = text_config["hidden_activation"]
+        .as_str()
+        .map(|s| s.to_string());
+    let final_logit_softcapping = text_config["final_logit_softcapping"].as_f64();
+    let attention_k_eq_v = text_config["attention_k_eq_v"].as_bool();
+    let sliding_window = text_config["sliding_window"].as_u64();
+    let global_head_dim = text_config["global_head_dim"].as_u64();
+    let num_global_key_value_heads = text_config["num_global_key_value_heads"].as_u64();
+    // GatedDeltaNet dims (Qwen3.5/3.8/3-Next "linear_attention" layers).
+    // Spec: run/specs/ops.md §"GatedDeltaNet". Present only when the model
+    // actually has linear_attention layers; omitted otherwise so plain
+    // LlamaStyle/LlamaStyle+ config stays exactly as clean as before.
+    let linear_num_value_heads = text_config["linear_num_value_heads"].as_u64();
+    let linear_num_key_heads = text_config["linear_num_key_heads"].as_u64();
+    let linear_key_head_dim = text_config["linear_key_head_dim"].as_u64();
+    let linear_value_head_dim = text_config["linear_value_head_dim"].as_u64();
+    let linear_conv_kernel_dim = text_config["linear_conv_kernel_dim"].as_u64();
+    let layer_types: Vec<String> = text_config["layer_types"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    println!(
+        "Architecture: {model_type}, hidden={hidden_size}, heads={num_heads}/{kv_heads}, \
+         layers={num_layers}, tie_embed={tie_word_embeddings}"
+    );
+    if !layer_types.is_empty() {
+        let n_sliding = layer_types.iter().filter(|t| *t == "sliding_attention").count();
+        let n_full = layer_types.iter().filter(|t| *t == "full_attention").count();
+        println!(
+            "LlamaStyle+: layer_types={n_sliding} sliding / {n_full} full, \
+             gh_dim={global_head_dim:?}, n_gkv={num_global_key_value_heads:?}, \
+             k_eq_v={attention_k_eq_v:?}, softcap={final_logit_softcapping:?}, \
+             act={hidden_activation:?}"
+        );
+    }
+
+    // Build the optional LlamaStyle+ block. Each field is added on its own
+    // line so the spec ordering is preserved and absent fields produce no
+    // dangling whitespace.
+    let mut llamaplus = String::new();
+    if let Some(act) = &hidden_activation {
+        llamaplus.push_str(&format!("hidden_activation = \"{act}\"\n"));
+    }
+    if let Some(cap) = final_logit_softcapping {
+        llamaplus.push_str(&format!("final_logit_softcapping = {cap}\n"));
+    }
+    if let Some(k_eq_v) = attention_k_eq_v {
+        llamaplus.push_str(&format!("attention_k_eq_v = {k_eq_v}\n"));
+    }
+    if let Some(win) = sliding_window {
+        llamaplus.push_str(&format!("sliding_window = {win}\n"));
+    }
+    if let Some(gh) = global_head_dim {
+        llamaplus.push_str(&format!("global_head_dim = {gh}\n"));
+    }
+    if let Some(gkv) = num_global_key_value_heads {
+        llamaplus.push_str(&format!("num_global_key_value_heads = {gkv}\n"));
+    }
+    if !layer_types.is_empty() {
+        let quoted: Vec<String> = layer_types
+            .iter()
+            .map(|s| format!("\"{}\"", s))
+            .collect();
+        llamaplus.push_str(&format!("layer_types = [{}]\n", quoted.join(", ")));
+    }
+    if let Some(rt_full) = rope_theta_full {
+        llamaplus.push_str(&format!("rope_theta_full = {rt_full}\n"));
+    }
+    if let Some(nvh) = linear_num_value_heads {
+        llamaplus.push_str(&format!("linear_num_value_heads = {nvh}\n"));
+    }
+    if let Some(nkh) = linear_num_key_heads {
+        llamaplus.push_str(&format!("linear_num_key_heads = {nkh}\n"));
+    }
+    if let Some(kd) = linear_key_head_dim {
+        llamaplus.push_str(&format!("linear_key_head_dim = {kd}\n"));
+    }
+    if let Some(vd) = linear_value_head_dim {
+        llamaplus.push_str(&format!("linear_value_head_dim = {vd}\n"));
+    }
+    if let Some(ck) = linear_conv_kernel_dim {
+        llamaplus.push_str(&format!("linear_conv_kernel_dim = {ck}\n"));
+    }
+    if let Some(prf) = partial_rotary_factor_full {
+        llamaplus.push_str(&format!("partial_rotary_factor_full = {prf}\n"));
+    }
+    if let Some(ms) = &mrope_section {
+        if ms.len() == 3 {
+            llamaplus.push_str(&format!("mrope_section = [{}, {}, {}]\n", ms[0], ms[1], ms[2]));
+        }
+    }
+    if let Some(id) = image_token_id {
+        llamaplus.push_str(&format!("image_token_id = {id}\n"));
+    }
+    if let Some(id) = video_token_id {
+        llamaplus.push_str(&format!("video_token_id = {id}\n"));
+    }
+    if let Some(id) = vision_start_token_id {
+        llamaplus.push_str(&format!("vision_start_token_id = {id}\n"));
+    }
+    if let Some(id) = vision_end_token_id {
+        llamaplus.push_str(&format!("vision_end_token_id = {id}\n"));
+    }
+
+    // [architecture.vision] — native VL tower config (ops.md
+    // §"VisionTower"). Only emitted when the source config has one.
+    let vision_section = if let Some(vc) = vision_config {
+        format!(
+            r#"
+[architecture.vision]
+hidden_size = {}
+num_heads = {}
+intermediate_size = {}
+depth = {}
+patch_size = {}
+in_channels = {}
+spatial_merge_size = {}
+temporal_patch_size = {}
+num_position_embeddings = {}
+out_hidden_size = {}
+rope_theta = {}
+"#,
+            vc["hidden_size"].as_u64().unwrap_or(1152),
+            vc["num_heads"].as_u64().unwrap_or(16),
+            vc["intermediate_size"].as_u64().unwrap_or(4304),
+            vc["depth"].as_u64().unwrap_or(27),
+            vc["patch_size"].as_u64().unwrap_or(16),
+            vc["in_channels"].as_u64().unwrap_or(3),
+            vc["spatial_merge_size"].as_u64().unwrap_or(2),
+            vc["temporal_patch_size"].as_u64().unwrap_or(2),
+            vc["num_position_embeddings"].as_u64().unwrap_or(2304),
+            vc["out_hidden_size"].as_u64().unwrap_or(hidden_size),
+            vision_rope_theta.round() as u64,
+        )
+    } else {
+        String::new()
+    };
+
+    // Canonical config — integers only. eps stored as 1/ε; rope_theta is
+    // already integer-valued in source (10000, 500000, 1_000_000 etc.).
+    let rms_norm_eps_inv = if rms_norm_eps > 0.0 && rms_norm_eps < 1.0 {
+        (1.0 / rms_norm_eps).round() as u64
+    } else {
+        // Source already provided 1/ε integer form; preserve.
+        rms_norm_eps.round() as u64
+    };
+    let rope_theta_int = rope_theta.round() as u64;
+    let config_toml = format!(
+        r#"model_type = "{model_type}"
+parameters = {params}
+
+[architecture]
+hidden_size = {hidden_size}
+num_attention_heads = {num_heads}
+num_key_value_heads = {kv_heads}
+head_dim = {head_dim}
+num_hidden_layers = {num_layers}
+intermediate_size = {intermediate_size}
+vocab_size = {vocab_size}
+max_position_embeddings = {max_pos}
+rope_theta = {rope_theta_int}
+rms_norm_eps = {rms_norm_eps_inv}
+tie_word_embeddings = {tie_word_embeddings}
+{llamaplus}{vision_section}
+[tokenizer]
+type = "bpe"
+eos_token = "{eos_token}"
+
+[sampling]
+temperature = 700
+top_p = 900
+scale = 1000
+
+[lineage]
+source = "{source}"
+"#,
+        params = hidden_size * num_layers * 12,
+        eos_token = eos_token_str,
+        source = config_json_path
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .unwrap_or(""),
+    );
+
+    let name = dir.file_name().and_then(|n| n.to_str()).unwrap_or("model");
+    let card = format!("# {name}\n\n{model_type}, {num_layers} layers, {hidden_size} hidden.\n");
+
+    // tokenizer.json → vocab.toml (via Python helper — includes added_tokens so
+    // chat-template specials like <|im_start|> don't decompose into single
+    // chars. See fix committed 57363817.).
+    let tokenizer_path = dir.join("tokenizer.json");
+    let vocab_toml = if tokenizer_path.exists() {
+        println!("Generating vocab.toml from tokenizer.json...");
+        match std::process::Command::new("python3")
+            .arg("-c")
+            .arg(format!(r#"
+import json, sys
+def esc(s):
+    r = []
+    for c in s:
+        if c == '\\': r.append('\\\\')
+        elif c == '"': r.append('\\"')
+        elif c == '\n': r.append('\\n')
+        elif c == '\t': r.append('\\t')
+        elif c == '\r': r.append('\\r')
+        elif ord(c) < 0x20: r.append(f'\\u{{ord(c):04X}}')
+        else: r.append(c)
+    return ''.join(r)
+with open('{}') as f: tok = json.load(f)
+m = tok.get('model', {{}})
+vocab = m.get('vocab', {{}})
+merges = m.get('merges', [])
+added = tok.get('added_tokens', [])
+lines = ['[tokens]']
+seen_ids = set()
+if isinstance(vocab, dict):
+    for t, i in sorted(vocab.items(), key=lambda x: x[1]):
+        lines.append(f'{{i}} = "{{esc(t)}}"')
+        seen_ids.add(i)
+else:
+    for i, item in enumerate(vocab):
+        t = item[0] if isinstance(item, list) else str(item)
+        lines.append(f'{{i}} = "{{esc(t)}}"')
+        seen_ids.add(i)
+# HF special tokens (e.g. <|im_start|>=151644, <|im_end|>=151645) live in
+# added_tokens — they have model-valid IDs but aren't in the base vocab.
+for at in added:
+    tid = at.get('id', -1)
+    content = at.get('content', '')
+    if tid >= 0 and content and tid not in seen_ids:
+        lines.append(f'{{tid}} = "{{esc(content)}}"')
+        seen_ids.add(tid)
+if merges:
+    lines.append('')
+    lines.append('[merges]')
+    for i, mg in enumerate(merges):
+        if isinstance(mg, list) and len(mg) == 2:
+            a, b = mg
+        elif isinstance(mg, str):
+            parts = mg.split(' ', 1)
+            if len(parts) != 2: continue
+            a, b = parts
+        else: continue
+        lines.append(f'{{i}} = ["{{esc(a)}}", "{{esc(b)}}"]')
+lines.append('')
+print('\n'.join(lines))
+"#, tokenizer_path.display()))
+            .output()
+        {
+            Ok(out) if out.status.success() => {
+                let v = String::from_utf8_lossy(&out.stdout).to_string();
+                println!("  vocab: {} lines", v.lines().count());
+                v
+            }
+            _ => {
+                eprintln!("Failed to generate vocab.toml");
+                String::new()
+            }
+        }
+    } else {
+        eprintln!("No tokenizer.json found");
+        String::new()
+    };
+
+    // Log dtype distribution for transparency. Names + dtype only — no
+    // tensor bytes touched, so this costs nothing extra on the lazy path.
+    {
+        let mut dtype_counts: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        for name in weights.names() {
+            if let Some(dtype) = weights.dtype_of(&name) {
+                *dtype_counts.entry(format!("{dtype:?}")).or_default() += 1;
+            }
+        }
+        let mut counts: Vec<_> = dtype_counts.into_iter().collect();
+        counts.sort();
+        println!("  dtypes: {:?}", counts);
+    }
+
+    println!("Packing {} tensors...", weights.len());
+    let mut tensors_lines: Vec<String> = Vec::new();
+    // Packed bytes stream straight to a temp file instead of an in-memory
+    // Vec — a 27B model's packed output alone is 15-20 GB, and holding
+    // both that and the source tensors in the heap is what wedged the
+    // importer at 54 GB resident on a 48 GB machine (gated-delta-vl-plan.md).
+    let weight_tmp_path = std::env::temp_dir().join(format!("{output_name}.weights.tmp"));
+    let weight_tmp_file = std::fs::File::create(&weight_tmp_path)
+        .map_err(|e| format!("cannot create {}: {e}", weight_tmp_path.display()))?;
+    let mut weight_out = std::io::BufWriter::new(weight_tmp_file);
+    let mut offset = 0usize;
+
+    let mut tensor_names: Vec<String> = weights.names();
+    tensor_names.sort();
+
+    // Existing HF-canonical names in the source. Used to detect K=V layers
+    // where v_proj is absent and must be materialised from k_proj.
+    let existing_hf: std::collections::HashSet<String> = tensor_names
+        .iter()
+        .map(|n| crate::naming::gguf_to_hf(n))
+        .collect();
+    // Per spec (import/specs/import.md §"K=V shared projection"): when
+    // the layer is K=V at the source (no v_proj tensor), the importer emits
+    // a v_proj tensor with the same bytes as k_proj. Runtime stays one
+    // codepath. Gemma-4 only sets K=V on full_attention layers.
+    let kv_eq_layers: std::collections::HashSet<usize> =
+        if attention_k_eq_v == Some(true) {
+            layer_types
+                .iter()
+                .enumerate()
+                .filter(|(_, t)| *t == "full_attention")
+                .map(|(i, _)| i)
+                .collect()
+        } else {
+            std::collections::HashSet::new()
+        };
+
+    let mut counts_by_enc: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+
+    for tname in &tensor_names {
+        let Some(w) = weights.take(tname) else {
+            eprintln!("warn: {tname} vanished between indexing and packing, skipping");
+            continue;
+        };
+        let w = &w;
+        let hf_name = crate::naming::gguf_to_hf(tname);
+
+        // K-quant pass-through / re-encoding strategy:
+        // - Q4_K source + weight matrix + 256-aligned K → write raw bytes as "q4k" (zero-copy)
+        // - Q6_K / Q5_K / Q3_K / Q2_K source + weight matrix + 256-aligned K →
+        //   dequant→f32→re-quantize as Q4K so the whole model is dtype-uniform.
+        //   Uniform dtype is required for the fused SIMD decode path.
+        // - MI_MATMUL_QUANT=q4k env override + weight matrix + 256-aligned K →
+        //   dequant→f32→quantize as Q4K regardless of source dtype. Opt-in
+        //   (default canonical policy below is unchanged for everyone else):
+        //   canonical "q4" is documented above `canonical_encoding_for` as
+        //   producing gibberish at hidden=5120+ scale, but GGUF-style Q4_K
+        //   (per-block scale+min, the same scheme llama.cpp ships at every
+        //   model size) is a different, better-calibrated format — already
+        //   has a real honeycrisp Metal kernel (`quant_matmul`'s QuantKind::Q4K)
+        //   and halves the bytes read per token vs. q8, which is what a
+        //   memory-bandwidth-bound decode step actually pays for.
+        let force_q4k = std::env::var("MI_MATMUL_QUANT").map(|v| v == "q4k").unwrap_or(false);
+        let is_kquant_weight = crate::naming::canonical_encoding_for(&hf_name) == "q8"
+            && w.shape.len() >= 2
+            && w.shape[w.shape.len() - 1] % 256 == 0;
+        let (written_enc, canonical_bytes): (&'static str, Vec<u8>) =
+            if w.dtype == crate::DType::Q4_K && is_kquant_weight && w.data.len() % 144 == 0 {
+                // GGUF bytes are already in [N, K] row-major layout (loader reverses dims, not bytes).
+                ("q4k", w.data.clone())
+            } else if (matches!(w.dtype,
+                    crate::DType::Q6_K | crate::DType::Q5_K |
+                    crate::DType::Q3_K | crate::DType::Q2_K)
+                || force_q4k)
+                && is_kquant_weight
+            {
+                // Re-encode as Q4K for uniform dtype (or opt-in speed).
+                let f32s = crate::dequantize_to_f32(&w.data, w.dtype);
+                if f32s.is_empty() {
+                    eprintln!("warn: {tname} dequant returned empty (dtype {:?})", w.dtype);
+                    continue;
+                }
+                let n = w.shape[0];
+                let k = w.shape[w.shape.len() - 1];
+                ("q4k", crate::quant::f32_to_q4k(&f32s, n, k))
+            } else {
+                // Default: dequant to f32 → re-encode with canonical policy.
+                let f32s = crate::dequantize_to_f32(&w.data, w.dtype);
+                if f32s.is_empty() {
+                    eprintln!("warn: {tname} dequant returned empty (dtype {:?})", w.dtype);
+                    continue;
+                }
+
+                let encoding = crate::naming::canonical_encoding_for(&hf_name);
+                // q4/q8/ternary require length % 32 == 0. Tensors whose element
+                // count isn't aligned (e.g. gemma-4's per-layer scalar) fall back
+                // to u32, which has no block-size constraint.
+                let needs_block = matches!(encoding, "q4" | "q8" | "ternary");
+                let enc: &'static str = if needs_block && f32s.len() % 32 != 0 {
+                    eprintln!(
+                        "warn: {hf_name} has {} elements, not a multiple of 32 — falling back to u32",
+                        f32s.len()
+                    );
+                    "u32"
+                } else {
+                    encoding
+                };
+                let bytes: Vec<u8> = match enc {
+                    "u32" => crate::quant::canonical::f32_to_u32(&f32s),
+                    "u16" => crate::quant::canonical::f32_to_u16(&f32s),
+                    "q4" => crate::quant::canonical::f32_to_q4(&f32s),
+                    "q8" => crate::quant::canonical::f32_to_q8(&f32s),
+                    "ternary" => crate::quant::canonical::f32_to_ternary(&f32s),
+                    other => {
+                        eprintln!("warn: unknown canonical encoding {other} for {hf_name}; using u32");
+                        crate::quant::canonical::f32_to_u32(&f32s)
+                    }
+                };
+                (enc, bytes)
+            };
+        counts_by_enc.entry(written_enc).and_modify(|c| *c += 1).or_insert(1);
+
+        let size = canonical_bytes.len();
+        let shape_str = w
+            .shape
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        tensors_lines.push(format!(
+            "[\"{}\"]\nshape    = [{}]\nencoding = \"{}\"\noffset   = {}\nsize     = {}\n",
+            hf_name, shape_str, written_enc, offset, size
+        ));
+        weight_out
+            .write_all(&canonical_bytes)
+            .map_err(|e| format!("writing {hf_name}: {e}"))?;
+        offset += size;
+        let data_ref: &[u8] = &canonical_bytes;
+
+        // K=V duplicate emission. If this is a k_proj for a K=V full layer
+        // and the source lacks v_proj, emit v_proj with identical bytes.
+        if let Some(rest) = hf_name.strip_prefix("model.layers.") {
+            if let Some(dot) = rest.find('.') {
+                if let Ok(layer_idx) = rest[..dot].parse::<usize>() {
+                    let suffix = &rest[dot + 1..];
+                    if suffix == "self_attn.k_proj.weight"
+                        && kv_eq_layers.contains(&layer_idx)
+                    {
+                        let v_name = format!(
+                            "model.layers.{layer_idx}.self_attn.v_proj.weight"
+                        );
+                        if !existing_hf.contains(&v_name) {
+                            tensors_lines.push(format!(
+                                "[\"{}\"]\nshape    = [{}]\nencoding = \"{}\"\noffset   = {}\nsize     = {}\n",
+                                v_name, shape_str, written_enc, offset, size
+                            ));
+                            weight_out
+                                .write_all(data_ref)
+                                .map_err(|e| format!("writing {v_name}: {e}"))?;
+                            offset += size;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let tensors_toml = tensors_lines.join("\n");
+
+    println!("Canonical encoding distribution:");
+    let mut entries: Vec<_> = counts_by_enc.iter().collect();
+    entries.sort_by_key(|(k, _)| *k);
+    for (enc, count) in entries {
+        println!("  {enc}: {count} tensors");
+    }
+    println!(
+        "  weights: {} bytes ({:.1} GB)",
+        offset,
+        offset as f64 / 1e9
+    );
+    weight_out
+        .flush()
+        .map_err(|e| format!("flushing {}: {e}", weight_tmp_path.display()))?;
+    drop(weight_out);
+
+    // The optional ~~~graph section is not part of the canonical .model
+    // spec (cyb/cyb-model). Re-introduce as a formal extension if useful.
+
+    let models_dir = crate::manifest::models_dir();
+    std::fs::create_dir_all(&models_dir)
+        .map_err(|e| format!("cannot create {}: {e}", models_dir.display()))?;
+    let output_path = models_dir.join(format!("{output_name}.model"));
+    println!("Writing {}...", output_path.display());
+
+    crate::cyb_format::write_model_file_streaming(
+        &output_path,
+        output_name,
+        &card,
+        &config_toml,
+        "",
+        "rs",
+        None,
+        &tensors_toml,
+        &vocab_toml,
+        "",
+        &weight_tmp_path,
+        offset as u64,
+    )
+    .map_err(|e| format!("write failed: {e}"))?;
+    let _ = std::fs::remove_file(&weight_tmp_path);
+    Ok(output_path)
+}
