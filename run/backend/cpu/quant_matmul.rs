@@ -63,18 +63,15 @@ pub fn matmul_quant_f32(
             x_data, w_bytes, &mut out, batch, n, k,
             CANONICAL_Q8_BLOCK_SIZE, CANONICAL_Q8_BLOCK_BYTES, canonical_q8_dot,
         )?,
-        DType::U32 | DType::U16 | DType::Ternary => {
-            // U32/U16/Ternary aren't matmul weight layouts — fall back to
-            // dequant-then-f32-matmul. These show up only on small tensors
-            // (norms, biases) which the forward path handles via separate
-            // ops, but dispatch here is correct as a safety net.
-            let w_f32 = canonical::q8_to_f32(&[]); // placeholder; never hit on a normal model
-            let _ = w_f32;
-            return Err(BackendError::UnsupportedDtype {
-                backend: "cpu",
-                dtype: w_dtype,
-                blocker: "matmul against U32/U16/Ternary not expected; norms/biases use other ops",
-            });
+        // Fixed-point weights are real matmul operands for CT-0
+        // cybergraph compiles (canonical u16 = 8.8 fixed-point); a
+        // synthesized zero MLP arrives as F32. Dequantize and run the
+        // f32 kernel — slower than the fused block kernels but exact,
+        // and these models are small.
+        DType::U32 | DType::U16 | DType::Ternary | DType::F32 | DType::F16 => {
+            let w_f32 = crate::backend::cpu::quant::try_dequantize_to_f32(w_bytes, w_dtype)?;
+            let w_t = Tensor::from_f32(vec![n, k], w_f32);
+            return crate::backend::cpu::matmul::matmul_f32(x, &w_t);
         }
         // legacy GGUF (kept for source-format reads at import time; runtime no longer hits these for canonical models)
         DType::Q4_0 => matmul_blocks(

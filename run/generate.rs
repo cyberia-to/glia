@@ -2,8 +2,8 @@
 //!
 //! Spec: specs/execution.md, specs/ops.md §8
 
-use crate::backend::{Backend, BackendError};
 use crate::arch::decoder::LlamaModel;
+use crate::backend::{Backend, BackendError};
 use crate::tokenizer::{ChatMessage, Tokenizer};
 
 /// Uniform interface for any model that can run one forward step and return logits.
@@ -56,39 +56,7 @@ impl Default for SampleConfig {
 pub fn sample(logits: &[f32], config: SampleConfig) -> u32 {
     match config.method {
         SampleKind::Greedy => argmax(logits) as u32,
-        SampleKind::TopP => {
-            let mut logits = logits.to_vec();
-            if config.temperature > 0.0 && config.temperature != 1.0 {
-                for l in &mut logits {
-                    *l /= config.temperature;
-                }
-            }
-            let probs = softmax(&logits);
-            let mut pairs: Vec<(usize, f32)> = probs.into_iter().enumerate().collect();
-            pairs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-            // Cumulative sum, keep until >= top_p
-            let mut cum = 0f32;
-            let mut keep = 0;
-            for (i, (_, p)) in pairs.iter().enumerate() {
-                cum += p;
-                keep = i + 1;
-                if cum >= config.top_p {
-                    break;
-                }
-            }
-            // Always keep at least the top 1
-            let kept = &pairs[..keep.max(1)];
-            let total: f32 = kept.iter().map(|(_, p)| *p).sum();
-            let r = rand_f32() * total;
-            let mut acc = 0f32;
-            for (id, p) in kept {
-                acc += p;
-                if acc >= r {
-                    return *id as u32;
-                }
-            }
-            kept[0].0 as u32
-        }
+        SampleKind::TopP => sample_top_p(logits, config.temperature, config.top_p),
         SampleKind::TopK => {
             let mut logits = logits.to_vec();
             if config.temperature > 0.0 && config.temperature != 1.0 {
@@ -96,10 +64,19 @@ pub fn sample(logits: &[f32], config: SampleConfig) -> u32 {
                     *l /= config.temperature;
                 }
             }
+            // Select the top-k in O(n), sort only those k.
             let mut pairs: Vec<(usize, f32)> = logits.into_iter().enumerate().collect();
+            let k = config.top_k.min(pairs.len()).max(1);
+            if k < pairs.len() {
+                pairs.select_nth_unstable_by(k - 1, |a, b| b.1.partial_cmp(&a.1).unwrap());
+                pairs.truncate(k);
+            }
             pairs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-            let kept = &pairs[..config.top_k.min(pairs.len())];
-            let max = kept.iter().map(|(_, v)| *v).fold(f32::NEG_INFINITY, f32::max);
+            let kept = &pairs[..];
+            let max = kept
+                .iter()
+                .map(|(_, v)| *v)
+                .fold(f32::NEG_INFINITY, f32::max);
             let exps: Vec<f32> = kept.iter().map(|(_, v)| (v - max).exp()).collect();
             let total: f32 = exps.iter().sum();
             let r = rand_f32() * total;
@@ -113,6 +90,85 @@ pub fn sample(logits: &[f32], config: SampleConfig) -> u32 {
             kept[0].0 as u32
         }
     }
+}
+
+/// Nucleus sampling without sorting the vocabulary.
+///
+/// The naive form softmaxes and *sorts* all |V| logits per token — ~152k
+/// pairs for the qwen family — and that sort was worth more wall time than
+/// the entire 28-layer forward pass: measured on an M4 Max, temperature 0.7
+/// halved decode from ~250 tok/s to ~105 against greedy. The distribution
+/// this samples from is exactly the old one; only the work changed:
+///
+/// 1. One O(|V|) pass finds the max (for a stable softmax).
+/// 2. One O(|V|) pass computes the full softmax denominator — the
+///    probabilities are true softmax over the whole vocabulary, not over a
+///    truncation.
+/// 3. An O(|V|) select pulls the top CANDIDATES logits; only those are
+///    sorted. The nucleus is found among them, cutting at top_p of *total*
+///    mass, same as before.
+/// 4. In the astronomically rare case the candidate set does not hold top_p
+///    of the mass (a near-uniform distribution), fall back to the full sort
+///    rather than sample from the wrong set.
+fn sample_top_p(logits: &[f32], temperature: f32, top_p: f32) -> u32 {
+    /// Plenty for any top_p anyone runs: at 0.95 the nucleus of a trained
+    /// model is a handful of tokens; 512 leaves two orders of margin.
+    const CANDIDATES: usize = 512;
+
+    let inv_t = if temperature > 0.0 {
+        1.0 / temperature
+    } else {
+        1.0
+    };
+    let max = logits.iter().fold(f32::NEG_INFINITY, |m, &l| m.max(l)) * inv_t;
+    let denom: f32 = logits.iter().map(|&l| (l * inv_t - max).exp()).sum();
+
+    let mut pairs: Vec<(usize, f32)> = logits.iter().map(|&l| l * inv_t).enumerate().collect();
+    let k = CANDIDATES.min(pairs.len()).max(1);
+    if k < pairs.len() {
+        pairs.select_nth_unstable_by(k - 1, |a, b| b.1.partial_cmp(&a.1).unwrap());
+        pairs.truncate(k);
+    }
+    pairs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+
+    // Probabilities against the FULL softmax denominator.
+    let mut cum = 0f32;
+    let mut keep = 0;
+    for (i, (_, l)) in pairs.iter().enumerate() {
+        cum += (l - max).exp() / denom;
+        keep = i + 1;
+        if cum >= top_p {
+            break;
+        }
+    }
+    if cum < top_p && k < logits.len() {
+        // The nucleus is wider than the candidate set: do it the slow,
+        // certain way.
+        let mut all: Vec<(usize, f32)> = logits.iter().map(|&l| l * inv_t).enumerate().collect();
+        all.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        pairs = all;
+        cum = 0.0;
+        keep = 0;
+        for (i, (_, l)) in pairs.iter().enumerate() {
+            cum += (l - max).exp() / denom;
+            keep = i + 1;
+            if cum >= top_p {
+                break;
+            }
+        }
+    }
+
+    let kept = &pairs[..keep.max(1)];
+    let total: f32 = kept.iter().map(|(_, l)| (l - max).exp() / denom).sum();
+    let r = rand_f32() * total;
+    let mut acc = 0f32;
+    for (id, l) in kept {
+        acc += (l - max).exp() / denom;
+        if acc >= r {
+            return *id as u32;
+        }
+    }
+    kept[0].0 as u32
 }
 
 fn argmax(logits: &[f32]) -> usize {
@@ -180,9 +236,19 @@ fn rand_f32() -> f32 {
     (x as f32) / (u64::MAX as f32)
 }
 
+/// Prompt vs decode throughput from one `generate` call.
+#[derive(Clone, Debug)]
+pub struct GenerateStats {
+    pub text: String,
+    pub tokens: usize,
+    pub prompt_tokens: usize,
+    /// Prompt tokens / prefill seconds.
+    pub tok_in_s: f32,
+    /// Generated tokens / decode seconds.
+    pub tok_out_s: f32,
+}
+
 /// Generate text autoregressively. Works with any [`ModelRunner`].
-///
-/// Returns (generated_text, generated_token_count).
 pub fn generate(
     model: &mut dyn ModelRunner,
     tok: &Tokenizer,
@@ -190,7 +256,7 @@ pub fn generate(
     prompt: &str,
     max_tokens: usize,
     sample_cfg: SampleConfig,
-) -> Result<(String, usize), BackendError> {
+) -> Result<GenerateStats, BackendError> {
     model.reset();
 
     // Tokenize prompt. Auto-prepend BOS if the model expects one (gemma
@@ -207,23 +273,21 @@ pub fn generate(
     if std::env::var("RUN_DEBUG_TOKENS").is_ok() {
         let pieces: Vec<String> = prompt_ids
             .iter()
-            .map(|&t| {
-                format!(
-                    "{t}=\"{}\"",
-                    tok.decode(&[t], false).replace('\n', "\\n")
-                )
-            })
+            .map(|&t| format!("{t}=\"{}\"", tok.decode(&[t], false).replace('\n', "\\n")))
             .collect();
         eprintln!("prompt encoded: [{}]", pieces.join(" "));
     }
 
     // Prefill: run forward for each prompt token, keep logits from last.
+    let t_prefill = std::time::Instant::now();
     let mut logits: Vec<f32> = Vec::new();
     for &tid in &prompt_ids {
         logits = model.step(tid, backend)?;
     }
+    let prefill_s = t_prefill.elapsed().as_secs_f32().max(1e-3);
 
     // Decode: sample next token, feed back in, repeat.
+    let t_decode = std::time::Instant::now();
     let debug_tokens = std::env::var("RUN_DEBUG_TOKENS").is_ok();
     // Cap initial capacity — callers may pass usize::MAX for "unlimited".
     let mut generated = Vec::with_capacity(max_tokens.min(1024));
@@ -235,11 +299,15 @@ pub fn generate(
             let top10: Vec<String> = idx
                 .iter()
                 .take(10)
-                .map(|&i| format!(
-                    "{i}={:.2}\"{}\"",
-                    logits[i],
-                    tok.decode(&[i as u32], false).replace('\n', "\\n").replace('"', "\\\"")
-                ))
+                .map(|&i| {
+                    format!(
+                        "{i}={:.2}\"{}\"",
+                        logits[i],
+                        tok.decode(&[i as u32], false)
+                            .replace('\n', "\\n")
+                            .replace('"', "\\\"")
+                    )
+                })
                 .collect();
             // Show rank+logit of a probe token if RUN_DEBUG_PROBE is set (e.g. 9079 for ▁Paris)
             let probe = std::env::var("RUN_DEBUG_PROBE")
@@ -248,7 +316,10 @@ pub fn generate(
             let probe_str = probe
                 .map(|p| {
                     let rank = idx.iter().position(|&i| i == p).unwrap_or(usize::MAX);
-                    format!(" probe[{p}]=#{rank}@{:.2}", logits.get(p).copied().unwrap_or(0.0))
+                    format!(
+                        " probe[{p}]=#{rank}@{:.2}",
+                        logits.get(p).copied().unwrap_or(0.0)
+                    )
                 })
                 .unwrap_or_default();
             eprintln!(
@@ -265,7 +336,15 @@ pub fn generate(
     }
 
     let text = tok.decode(&generated, false);
-    Ok((text, generated.len()))
+    let decode_s = t_decode.elapsed().as_secs_f32().max(1e-3);
+    let tokens = generated.len();
+    Ok(GenerateStats {
+        text,
+        tokens,
+        prompt_tokens: prompt_ids.len(),
+        tok_in_s: prompt_ids.len() as f32 / prefill_s,
+        tok_out_s: tokens as f32 / decode_s,
+    })
 }
 
 /// Build a prompt from a chat message list using the model's template.
@@ -290,7 +369,10 @@ mod tests {
         let mut logits = [2.0f32, -1.0, 3.0, -4.0];
         apply_repetition_penalty(&mut logits, &[0, 1], 2.0);
         assert!((logits[0] - 1.0).abs() < 1e-6, "positive → divided by 2");
-        assert!((logits[1] - (-2.0)).abs() < 1e-6, "negative → multiplied by 2");
+        assert!(
+            (logits[1] - (-2.0)).abs() < 1e-6,
+            "negative → multiplied by 2"
+        );
         // Indices not in recent list untouched
         assert_eq!(logits[2], 3.0);
         assert_eq!(logits[3], -4.0);

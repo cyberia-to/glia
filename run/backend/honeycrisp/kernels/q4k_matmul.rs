@@ -449,6 +449,55 @@ pub fn dispatch(
     Ok(out)
 }
 
+/// Dispatch for `MSL_LARGE`: SIMD-parallel, `SIMDS_PER_GROUP` (16) output
+/// rows per threadgroup, `LANES` (32) lanes cooperating on each row via
+/// `simd_sum`. `MSL_LARGE` was written but never given a matching launch —
+/// the plain `dispatch()` above launches `(64,1,1)`-thread groups, which is
+/// only correct for the scalar 1-thread-per-row `MSL` kernel; calling
+/// `MSL_LARGE` through it starves 14 of every 16 simdgroups the kernel
+/// assumes exist per threadgroup (`row_global = tgpig_x*16 + sgitg` reads
+/// stale/wrong `row` for any `sgitg >= 2`, since only `64/32 = 2` simdgroups
+/// actually launch). Mirrors `q8_matmul::dispatch`'s launch geometry, which
+/// gets this right for the same threadgroup shape.
+pub fn dispatch_large(
+    dev: &HoneycrispDevice,
+    pipeline: &aruminium::Pipeline,
+    x: &aruminium::Buffer,
+    w: &aruminium::Buffer,
+    batch: u32,
+    n_rows: u32,
+    n_blocks: u32,
+) -> Result<aruminium::Buffer, BackendError> {
+    let total_rows = batch * n_rows;
+    let out = dev.alloc((total_rows * 4) as usize)?;
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct Dims { batch: u32, n_rows: u32, n_blocks: u32, pad: u32 }
+    let dims = Dims { batch, n_rows, n_blocks, pad: 0 };
+
+    let groups_x = (total_rows + SIMDS_PER_GROUP - 1) / SIMDS_PER_GROUP;
+    let threads_per_group = SIMDS_PER_GROUP * LANES;
+
+    unsafe {
+        aruminium::autorelease_pool(|| {
+            dev.dispatch.batch_raw(|enc| {
+                enc.bind(pipeline);
+                enc.bind_buffer(x, 0, 0);
+                enc.bind_buffer(w, 0, 1);
+                enc.bind_buffer(&out, 0, 2);
+                let bytes = std::slice::from_raw_parts(
+                    &dims as *const Dims as *const u8,
+                    std::mem::size_of::<Dims>(),
+                );
+                enc.push(bytes, 3);
+                enc.launch_groups((groups_x as usize, 1, 1), (threads_per_group as usize, 1, 1));
+            });
+        });
+    }
+    Ok(out)
+}
+
 /// Compute threadgroup count for SIMD-parallel kernels (SPG=16, LANES=32).
 pub fn tg_count(n_rows: u32, batch: u32) -> usize {
     let total = (n_rows * batch) as usize;

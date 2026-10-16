@@ -285,6 +285,201 @@ fn load_safetensors_single(path: &Path) -> Result<Weights, String> {
     Ok(weights)
 }
 
+// ── lazy reader (streaming import path) ─────────────────────────────────────
+//
+// The eager loaders above build one `Weights` holding every tensor's bytes
+// copied out of the mmap — fine at 8B (a few GB), but a 27B model's ~55 GB
+// of source bytes plus the packer's own growing output made `import_as`
+// peak at 54 GB resident and wedge on a 48 GB machine. The mmaps themselves
+// cost nothing until touched; only the eager `.to_vec()` per tensor forces
+// the whole model into the heap at once. This type keeps the mmaps open and
+// defers that copy to one tensor at a time, so the pipeline can pack-and-
+// write-and-drop each tensor before touching the next.
+
+/// One shard's mmap plus where its tensor data begins.
+struct LazyShard {
+    mmap: memmap2::Mmap,
+}
+
+/// Where one tensor lives: which shard, what it is, and its byte range
+/// within that shard's mmap (already resolved to local offsets for the
+/// multi-shard case, so `read` never has to know about global vs. local).
+struct TensorLocation {
+    shard: String,
+    dtype: DType,
+    shape: Vec<usize>,
+    byte_start: usize,
+    byte_end: usize,
+}
+
+/// A safetensors model (single-file or sharded), indexed but not loaded.
+pub struct LazySafetensors {
+    shards: HashMap<String, LazyShard>,
+    index: HashMap<String, TensorLocation>,
+}
+
+impl LazySafetensors {
+    /// Every tensor name this model has — cheap, no data touched.
+    pub fn names(&self) -> Vec<String> {
+        self.index.keys().cloned().collect()
+    }
+
+    /// dtype + shape without copying the tensor's bytes.
+    pub fn dtype_shape(&self, name: &str) -> Option<(DType, Vec<usize>)> {
+        self.index.get(name).map(|t| (t.dtype, t.shape.clone()))
+    }
+
+    /// Copy this one tensor's bytes out of its shard's mmap. The caller
+    /// owns the result and should let it drop once packed — that's the
+    /// whole point.
+    pub fn read(&self, name: &str) -> Option<Weight> {
+        let loc = self.index.get(name)?;
+        let shard = self.shards.get(&loc.shard)?;
+        if loc.byte_end > shard.mmap.len() {
+            log::warn!(
+                "Tensor {name} OOB in {}: {} > {}",
+                loc.shard, loc.byte_end, shard.mmap.len()
+            );
+            return None;
+        }
+        Some(Weight {
+            data: shard.mmap[loc.byte_start..loc.byte_end].to_vec(),
+            shape: loc.shape.clone(),
+            dtype: loc.dtype,
+            needs_transpose: false,
+        })
+    }
+}
+
+/// Index a safetensors model (single file or sharded index) without
+/// reading any tensor data. Mirrors [`load_safetensors`]'s dispatch.
+pub fn open_lazy(path: &Path) -> Result<LazySafetensors, String> {
+    if let Some(dir) = path.parent() {
+        let index_path = dir.join("model.safetensors.index.json");
+        if index_path.exists() {
+            return open_lazy_sharded(dir, &index_path);
+        }
+    }
+    open_lazy_single(path)
+}
+
+fn parse_shard_header(path: &Path) -> Result<(memmap2::Mmap, usize, HashMap<String, TensorDescriptor>), String> {
+    let file = std::fs::File::open(path)
+        .map_err(|e| format!("Cannot open {}: {e}", path.display()))?;
+    let mmap = unsafe {
+        memmap2::Mmap::map(&file).map_err(|e| format!("Cannot mmap {}: {e}", path.display()))?
+    };
+    if mmap.len() < 8 {
+        return Err(format!("{} too small for safetensors", path.display()));
+    }
+    let header_size = u64::from_le_bytes([
+        mmap[0], mmap[1], mmap[2], mmap[3], mmap[4], mmap[5], mmap[6], mmap[7],
+    ]) as usize;
+    if 8 + header_size > mmap.len() {
+        return Err(format!(
+            "Header size {header_size} exceeds file size {} in {}",
+            mmap.len(), path.display()
+        ));
+    }
+    let header_str = std::str::from_utf8(&mmap[8..8 + header_size])
+        .map_err(|e| format!("Invalid UTF-8 in {}'s header: {e}", path.display()))?;
+    let raw: HashMap<String, serde_json::Value> = serde_json::from_str(header_str)
+        .map_err(|e| format!("Invalid JSON in {}'s header: {e}", path.display()))?;
+    let mut descriptors = HashMap::new();
+    for (name, value) in raw {
+        if name == "__metadata__" {
+            continue;
+        }
+        let desc: TensorDescriptor = serde_json::from_value(value)
+            .map_err(|e| format!("Invalid tensor descriptor for {name}: {e}"))?;
+        descriptors.insert(name, desc);
+    }
+    let data_start = 8 + header_size;
+    Ok((mmap, data_start, descriptors))
+}
+
+fn open_lazy_single(path: &Path) -> Result<LazySafetensors, String> {
+    let (mmap, data_start, descriptors) = parse_shard_header(path)?;
+    let shard_key = path.display().to_string();
+    let mut index = HashMap::new();
+    for (name, desc) in descriptors {
+        let [start, end] = desc.data_offsets;
+        index.insert(
+            name,
+            TensorLocation {
+                shard: shard_key.clone(),
+                dtype: safetensors_dtype(&desc.dtype),
+                shape: desc.shape,
+                byte_start: data_start + start as usize,
+                byte_end: data_start + end as usize,
+            },
+        );
+    }
+    let mut shards = HashMap::new();
+    shards.insert(shard_key, LazyShard { mmap });
+    log::info!("Safetensors indexed (lazy): {} tensors from {}", index.len(), path.display());
+    Ok(LazySafetensors { shards, index })
+}
+
+fn open_lazy_sharded(dir: &Path, index_path: &Path) -> Result<LazySafetensors, String> {
+    let index_str = std::fs::read_to_string(index_path)
+        .map_err(|e| format!("Cannot read index: {e}"))?;
+    let index_json: serde_json::Value = serde_json::from_str(&index_str)
+        .map_err(|e| format!("Invalid index JSON: {e}"))?;
+    let weight_map = index_json
+        .get("weight_map")
+        .and_then(|v| v.as_object())
+        .ok_or("No weight_map in index")?;
+
+    let mut tensor_to_shard: HashMap<String, String> = HashMap::new();
+    for (tensor_name, shard) in weight_map {
+        if let Some(s) = shard.as_str() {
+            tensor_to_shard.insert(tensor_name.clone(), s.to_string());
+        }
+    }
+    let mut shard_files: Vec<String> = tensor_to_shard.values().cloned().collect::<std::collections::HashSet<_>>().into_iter().collect();
+    shard_files.sort();
+
+    let mut shards = HashMap::new();
+    let mut index = HashMap::new();
+    for shard_file in &shard_files {
+        let (mmap, data_start, descriptors) = parse_shard_header(&dir.join(shard_file))?;
+
+        // Same local-offset resolution as the eager sharded loader: sort
+        // this shard's tensors by their (shard-local) source offset, then
+        // lay them out back to back from data_start.
+        let mut ordered: Vec<(&String, &TensorDescriptor)> = descriptors
+            .iter()
+            .filter(|(n, _)| tensor_to_shard.get(*n).map(|s| s.as_str()) == Some(shard_file.as_str()))
+            .collect();
+        ordered.sort_by_key(|(_, d)| d.data_offsets[0]);
+
+        let mut local_pos = 0usize;
+        for (name, desc) in ordered {
+            let size = (desc.data_offsets[1] - desc.data_offsets[0]) as usize;
+            let byte_start = data_start + local_pos;
+            let byte_end = byte_start + size;
+            index.insert(
+                name.clone(),
+                TensorLocation {
+                    shard: shard_file.clone(),
+                    dtype: safetensors_dtype(&desc.dtype),
+                    shape: desc.shape.clone(),
+                    byte_start,
+                    byte_end,
+                },
+            );
+            local_pos += size;
+        }
+        shards.insert(shard_file.clone(), LazyShard { mmap });
+    }
+    log::info!(
+        "Safetensors indexed (lazy): {} tensors from {} shards in {}",
+        index.len(), shards.len(), dir.display()
+    );
+    Ok(LazySafetensors { shards, index })
+}
+
 /// Convert safetensors dtype string to DType
 fn safetensors_dtype(s: &str) -> DType {
     match s {

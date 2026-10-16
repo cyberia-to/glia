@@ -13,12 +13,14 @@ pub mod bench;
 pub mod core;
 pub mod format;
 pub mod generate;
+pub mod multimodal;
+pub mod vision_preprocess;
 pub mod ir;
 pub mod manifest;
 pub mod tokenizer;
 
 pub use backend::{Backend, BackendError, BackendKind};
-pub use generate::ModelRunner;
+pub use generate::{GenerateStats, ModelRunner};
 pub use ir::GraphRunner;
 pub use core::{DType, Op, PoolMode, InterpolateMode, SampleMethod, Tensor, Shape};
 pub use format::{read_model_file, LoadedModel, ModelFile, TensorMeta};

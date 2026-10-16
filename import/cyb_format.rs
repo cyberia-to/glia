@@ -10,13 +10,12 @@
 use std::io::{self, Write};
 use std::path::Path;
 
-/// Pack the sections + weights into a single `.model` file at `output_path`.
-///
-/// `graph` is optional hex-encoded binary IR — when `Some`, a `~~~graph`
-/// section is inserted between `~~~config` and `~~~tensors` and declared
-/// in the frontmatter.  When `None` the file is identical to the old format.
+/// Write every section except the trailing `~~~weights` blob — the part
+/// [`write_model_file`] and [`write_model_file_streaming`] share. Returns
+/// the open file, positioned right after the `~~~weights\n` marker, ready
+/// for the caller to append exactly `weights_len` bytes however it likes.
 #[allow(clippy::too_many_arguments)]
-pub fn write_model_file(
+fn write_model_header(
     output_path: &Path,
     name: &str,
     card: &str,
@@ -27,8 +26,8 @@ pub fn write_model_file(
     tensors_toml: &str,
     vocab: &str,
     eval: &str,
-    weights: &[u8],
-) -> io::Result<()> {
+    weights_len: u64,
+) -> io::Result<std::fs::File> {
     let mut f = std::fs::File::create(output_path)?;
 
     // --- TOML frontmatter ---
@@ -62,7 +61,7 @@ pub fn write_model_file(
     writeln!(f, "[[files]]")?;
     writeln!(f, "name = \"weights\"")?;
     writeln!(f, "format = \"tensors\"")?;
-    writeln!(f, "size = {}", weights.len())?;
+    writeln!(f, "size = {weights_len}")?;
 
     // --- Named text sections ---
     for (marker, body) in [
@@ -88,9 +87,68 @@ pub fn write_model_file(
         }
     }
 
-    // --- Binary weights ---
     writeln!(f, "~~~weights")?;
-    f.write_all(weights)?;
+    Ok(f)
+}
 
+/// Pack the sections + weights into a single `.model` file at `output_path`.
+///
+/// `graph` is optional hex-encoded binary IR — when `Some`, a `~~~graph`
+/// section is inserted between `~~~config` and `~~~tensors` and declared
+/// in the frontmatter.  When `None` the file is identical to the old format.
+#[allow(clippy::too_many_arguments)]
+pub fn write_model_file(
+    output_path: &Path,
+    name: &str,
+    card: &str,
+    config: &str,
+    program: &str,
+    program_format: &str,
+    graph: Option<&str>,
+    tensors_toml: &str,
+    vocab: &str,
+    eval: &str,
+    weights: &[u8],
+) -> io::Result<()> {
+    let mut f = write_model_header(
+        output_path, name, card, config, program, program_format, graph,
+        tensors_toml, vocab, eval, weights.len() as u64,
+    )?;
+    f.write_all(weights)
+}
+
+/// Same file, but the weights come from a file on disk rather than a
+/// buffer in memory — for models whose packed bytes are too large to
+/// hold alongside the source tensors without exceeding physical RAM
+/// (see `run/specs/gated-delta-vl-plan.md`, "import itself OOMs"). The
+/// source file is copied in, not held whole — `io::copy` streams through
+/// a small fixed buffer regardless of `weights_len`.
+#[allow(clippy::too_many_arguments)]
+pub fn write_model_file_streaming(
+    output_path: &Path,
+    name: &str,
+    card: &str,
+    config: &str,
+    program: &str,
+    program_format: &str,
+    graph: Option<&str>,
+    tensors_toml: &str,
+    vocab: &str,
+    eval: &str,
+    weights_src: &Path,
+    weights_len: u64,
+) -> io::Result<()> {
+    let mut f = write_model_header(
+        output_path, name, card, config, program, program_format, graph,
+        tensors_toml, vocab, eval, weights_len,
+    )?;
+    let mut src = std::fs::File::open(weights_src)?;
+    let copied = io::copy(&mut src, &mut f)?;
+    if copied != weights_len {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            format!("weights source had {copied} bytes, expected {weights_len}"),
+        ));
+    }
     Ok(())
 }

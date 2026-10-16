@@ -154,7 +154,7 @@ layer_types = [
 global_head_dim = 512
 num_global_key_value_heads = 4
 
-# Gemma-4 only: per-kind RoPE. rope_theta (above) is the sliding value.
+# Per-kind RoPE. rope_theta (above) is the sliding value.
 # rope_theta_full is the full-attention value.
 # partial_rotary_factor_full is the fraction of head_dim that gets
 # rotated for full layers (rest pass through unrotated).
@@ -165,6 +165,29 @@ partial_rotary_factor_full = 0.25
 A model is LlamaStyle (no plus) when none of the above are present and
 no `layer_types` array is set. Presence of any of these fields triggers
 the LlamaStyle+ codepath. See `arch.md` §LlamaStyle+ for semantics.
+
+**Two different source JSON shapes feed the same `_full` fields.**
+Gemma-4's `rope_parameters` is itself split into
+`{sliding_attention: {...}, full_attention: {...}}` sub-dicts — the
+importer reads `full_attention.rope_theta`/`.partial_rotary_factor`
+directly. Qwen3.5/3.8 (`linear_attention` + `full_attention` layer
+mix, GatedDeltaNet — see ops.md §"GatedDeltaNet") has a THIRD shape:
+`rope_parameters` is flat (`{rope_theta, partial_rotary_factor,
+rope_type, ...}`, no per-kind sub-dicts) because only ONE layer kind
+in that family ever calls RoPE at all (`full_attention`/Sdpa;
+`linear_attention` layers never rotate). The importer (`import/
+pipeline.rs`) routes this flat dict's values into the same
+`rope_theta_full`/`partial_rotary_factor_full` fields Gemma-4 uses —
+correct because Qwen3.5/3.8's non-full layers ignore both anyway. Get
+this fallback wrong (miss the flat shape, only handle the nested one)
+and rope_theta silently defaults to 10000.0 for a model whose real
+value is 10_000_000 or 1_000_000 — wrong numbers, no crash, no shape
+mismatch to catch it. This exact bug shipped for a full session
+(2026-09-11) affecting BOTH `Qwen3-8B-heretic` (rope_theta 10000 vs
+real 1000000, single-kind — every layer affected) and
+`Qwen3.8-27B-heretic-ara` (rope_theta_full and partial_rotary_factor_full
+both silently absent, affecting its 16 real full_attention layers) —
+fixed 2026-09-12, see `run/specs/gated-delta-vl-plan.md`.
 
 ### VL config example (qwen2_vl)
 

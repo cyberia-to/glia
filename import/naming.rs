@@ -48,6 +48,18 @@ pub fn gguf_to_hf(name: &str) -> String {
         return "lm_head.weight".into();
     }
 
+    // VL checkpoints (Qwen3.5/3.8, qwen2_vl, ...) nest the text decoder
+    // under `model.language_model.*` instead of `model.*` — every other
+    // HF safetensors source (including this same family's own non-VL
+    // releases) uses `model.*` directly, and every tensor lookup in
+    // `run/arch/decoder/weights.rs` hardcodes that shorter prefix.
+    // Collapsing it here means the runtime needs no VL-aware branch to
+    // find `model.layers.N.*` — a text-only decode already works the
+    // moment the tensors have the name it expects.
+    if let Some(rest) = name.strip_prefix("model.language_model.") {
+        return format!("model.{rest}");
+    }
+
     if let Some(rest) = name.strip_prefix("blk.") {
         if let Some(dot) = rest.find('.') {
             let layer_num = &rest[..dot];
