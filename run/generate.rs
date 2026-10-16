@@ -2,8 +2,8 @@
 //!
 //! Spec: specs/execution.md, specs/ops.md §8
 
-use crate::backend::{Backend, BackendError};
 use crate::arch::decoder::LlamaModel;
+use crate::backend::{Backend, BackendError};
 use crate::tokenizer::{ChatMessage, Tokenizer};
 
 /// Uniform interface for any model that can run one forward step and return logits.
@@ -73,7 +73,10 @@ pub fn sample(logits: &[f32], config: SampleConfig) -> u32 {
             }
             pairs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
             let kept = &pairs[..];
-            let max = kept.iter().map(|(_, v)| *v).fold(f32::NEG_INFINITY, f32::max);
+            let max = kept
+                .iter()
+                .map(|(_, v)| *v)
+                .fold(f32::NEG_INFINITY, f32::max);
             let exps: Vec<f32> = kept.iter().map(|(_, v)| (v - max).exp()).collect();
             let total: f32 = exps.iter().sum();
             let r = rand_f32() * total;
@@ -112,7 +115,11 @@ fn sample_top_p(logits: &[f32], temperature: f32, top_p: f32) -> u32 {
     /// model is a handful of tokens; 512 leaves two orders of margin.
     const CANDIDATES: usize = 512;
 
-    let inv_t = if temperature > 0.0 { 1.0 / temperature } else { 1.0 };
+    let inv_t = if temperature > 0.0 {
+        1.0 / temperature
+    } else {
+        1.0
+    };
     let max = logits.iter().fold(f32::NEG_INFINITY, |m, &l| m.max(l)) * inv_t;
     let denom: f32 = logits.iter().map(|&l| (l * inv_t - max).exp()).sum();
 
@@ -229,9 +236,19 @@ fn rand_f32() -> f32 {
     (x as f32) / (u64::MAX as f32)
 }
 
+/// Prompt vs decode throughput from one `generate` call.
+#[derive(Clone, Debug)]
+pub struct GenerateStats {
+    pub text: String,
+    pub tokens: usize,
+    pub prompt_tokens: usize,
+    /// Prompt tokens / prefill seconds.
+    pub tok_in_s: f32,
+    /// Generated tokens / decode seconds.
+    pub tok_out_s: f32,
+}
+
 /// Generate text autoregressively. Works with any [`ModelRunner`].
-///
-/// Returns (generated_text, generated_token_count).
 pub fn generate(
     model: &mut dyn ModelRunner,
     tok: &Tokenizer,
@@ -239,7 +256,7 @@ pub fn generate(
     prompt: &str,
     max_tokens: usize,
     sample_cfg: SampleConfig,
-) -> Result<(String, usize), BackendError> {
+) -> Result<GenerateStats, BackendError> {
     model.reset();
 
     // Tokenize prompt. Auto-prepend BOS if the model expects one (gemma
@@ -256,23 +273,21 @@ pub fn generate(
     if std::env::var("RUN_DEBUG_TOKENS").is_ok() {
         let pieces: Vec<String> = prompt_ids
             .iter()
-            .map(|&t| {
-                format!(
-                    "{t}=\"{}\"",
-                    tok.decode(&[t], false).replace('\n', "\\n")
-                )
-            })
+            .map(|&t| format!("{t}=\"{}\"", tok.decode(&[t], false).replace('\n', "\\n")))
             .collect();
         eprintln!("prompt encoded: [{}]", pieces.join(" "));
     }
 
     // Prefill: run forward for each prompt token, keep logits from last.
+    let t_prefill = std::time::Instant::now();
     let mut logits: Vec<f32> = Vec::new();
     for &tid in &prompt_ids {
         logits = model.step(tid, backend)?;
     }
+    let prefill_s = t_prefill.elapsed().as_secs_f32().max(1e-3);
 
     // Decode: sample next token, feed back in, repeat.
+    let t_decode = std::time::Instant::now();
     let debug_tokens = std::env::var("RUN_DEBUG_TOKENS").is_ok();
     // Cap initial capacity — callers may pass usize::MAX for "unlimited".
     let mut generated = Vec::with_capacity(max_tokens.min(1024));
@@ -284,11 +299,15 @@ pub fn generate(
             let top10: Vec<String> = idx
                 .iter()
                 .take(10)
-                .map(|&i| format!(
-                    "{i}={:.2}\"{}\"",
-                    logits[i],
-                    tok.decode(&[i as u32], false).replace('\n', "\\n").replace('"', "\\\"")
-                ))
+                .map(|&i| {
+                    format!(
+                        "{i}={:.2}\"{}\"",
+                        logits[i],
+                        tok.decode(&[i as u32], false)
+                            .replace('\n', "\\n")
+                            .replace('"', "\\\"")
+                    )
+                })
                 .collect();
             // Show rank+logit of a probe token if RUN_DEBUG_PROBE is set (e.g. 9079 for ▁Paris)
             let probe = std::env::var("RUN_DEBUG_PROBE")
@@ -297,7 +316,10 @@ pub fn generate(
             let probe_str = probe
                 .map(|p| {
                     let rank = idx.iter().position(|&i| i == p).unwrap_or(usize::MAX);
-                    format!(" probe[{p}]=#{rank}@{:.2}", logits.get(p).copied().unwrap_or(0.0))
+                    format!(
+                        " probe[{p}]=#{rank}@{:.2}",
+                        logits.get(p).copied().unwrap_or(0.0)
+                    )
                 })
                 .unwrap_or_default();
             eprintln!(
@@ -314,7 +336,15 @@ pub fn generate(
     }
 
     let text = tok.decode(&generated, false);
-    Ok((text, generated.len()))
+    let decode_s = t_decode.elapsed().as_secs_f32().max(1e-3);
+    let tokens = generated.len();
+    Ok(GenerateStats {
+        text,
+        tokens,
+        prompt_tokens: prompt_ids.len(),
+        tok_in_s: prompt_ids.len() as f32 / prefill_s,
+        tok_out_s: tokens as f32 / decode_s,
+    })
 }
 
 /// Build a prompt from a chat message list using the model's template.
@@ -339,7 +369,10 @@ mod tests {
         let mut logits = [2.0f32, -1.0, 3.0, -4.0];
         apply_repetition_penalty(&mut logits, &[0, 1], 2.0);
         assert!((logits[0] - 1.0).abs() < 1e-6, "positive → divided by 2");
-        assert!((logits[1] - (-2.0)).abs() < 1e-6, "negative → multiplied by 2");
+        assert!(
+            (logits[1] - (-2.0)).abs() < 1e-6,
+            "negative → multiplied by 2"
+        );
         // Indices not in recent list untouched
         assert_eq!(logits[2], 3.0);
         assert_eq!(logits[3], -4.0);

@@ -181,11 +181,14 @@ pub fn run(args: Vec<String>) {
 
     let t_gen = Instant::now();
     match generate(runner.as_mut(), &tok, &*backend, &final_prompt, max_tokens, cfg) {
-        Ok((text, count)) => {
+        Ok(stats) => {
             let dt = t_gen.elapsed().as_secs_f64();
-            println!("{text}");
+            println!("{}", stats.text);
             println!("---");
-            println!("Generated {count} tokens in {dt:.1}s ({:.1} tok/s)", count as f64 / dt);
+            println!(
+                "Generated {} tokens in {dt:.1}s (in {:.0} / out {:.0} tok/s)",
+                stats.tokens, stats.tok_in_s, stats.tok_out_s,
+            );
         }
         Err(e) => { eprintln!("generate failed: {e}"); std::process::exit(1); }
     }
