@@ -612,6 +612,12 @@ pub fn hex_encode(bytes: &[u8]) -> String {
 /// Decode lowercase (or uppercase) hex string to bytes.
 pub fn hex_decode(s: &str) -> Result<Vec<u8>, SerialError> {
     let s = s.trim();
+    if !s.is_ascii() {
+        return Err(SerialError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "bad hex",
+        )));
+    }
     if s.len() % 2 != 0 {
         return Err(SerialError::Truncated("hex string odd length"));
     }
@@ -621,4 +627,35 @@ pub fn hex_decode(s: &str) -> Result<Vec<u8>, SerialError> {
                 .map_err(|_| SerialError::Io(io::Error::new(io::ErrorKind::InvalidData, "bad hex")))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod hex_decode_tests {
+    use super::*;
+
+    #[test]
+    fn round_trips() {
+        let bytes = [0u8, 1, 2, 254, 255];
+        assert_eq!(hex_decode(&hex_encode(&bytes)).unwrap(), bytes);
+    }
+
+    #[test]
+    fn rejects_non_ascii_without_panicking() {
+        // A model file's hex-encoded graph section (`format.rs`'s
+        // `hex_decode(hex)` call) is untrusted file content. "a" + a
+        // 3-byte '中' + two more ASCII bytes is 6 bytes (even, so the old
+        // length check passed) but the fixed byte-index slicing
+        // (`&s[2*i..2*i+2]`) lands its first chunk inside '中' — a byte
+        // index that is not a char boundary — and panics instead of
+        // returning an error.
+        let s = "a中aa";
+        assert_eq!(s.len(), 6);
+        assert!(hex_decode(s).is_err());
+    }
+
+    #[test]
+    fn rejects_odd_length_and_bad_digits() {
+        assert!(hex_decode("abc").is_err());
+        assert!(hex_decode("zz").is_err());
+    }
 }

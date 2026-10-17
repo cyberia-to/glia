@@ -32,6 +32,7 @@ fn small_config() -> TransformerConfig {
         max_seq_len: 64,
         activation: run::ir::Activation::Silu,
         has_qk_norm: false,
+        has_attn_bias: false,
     }
 }
 

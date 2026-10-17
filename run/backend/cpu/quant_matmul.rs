@@ -364,7 +364,7 @@ fn canonical_q8_dot(x: &[f32], w_bytes: &[u8], blocks: usize) -> f32 {
 
 #[inline(always)]
 fn read_f16(bytes: &[u8]) -> f32 {
-    debug_assert_eq!(bytes.len(), 2);
+    assert_eq!(bytes.len(), 2, "read_f16: expected 2 bytes, got {}", bytes.len());
     half::f16::from_bits(u16::from_le_bytes([bytes[0], bytes[1]])).to_f32()
 }
 
@@ -377,7 +377,7 @@ fn slice8(s: &[f32]) -> [f32; 8] {
 /// `shift = 0` selects low nibbles, `shift = 4` selects high nibbles.
 #[inline(always)]
 fn nibbles_f32x8(bytes: &[u8], shift: u32) -> f32x8 {
-    debug_assert_eq!(bytes.len(), 8);
+    assert_eq!(bytes.len(), 8, "nibbles_f32x8: expected 8 bytes, got {}", bytes.len());
     f32x8::from([
         ((bytes[0] >> shift) & 0x0F) as f32,
         ((bytes[1] >> shift) & 0x0F) as f32,
@@ -393,7 +393,7 @@ fn nibbles_f32x8(bytes: &[u8], shift: u32) -> f32x8 {
 /// Convert 8 signed bytes to f32x8.
 #[inline(always)]
 fn i8_bytes_f32x8(bytes: &[u8]) -> f32x8 {
-    debug_assert_eq!(bytes.len(), 8);
+    assert_eq!(bytes.len(), 8, "i8_bytes_f32x8: expected 8 bytes, got {}", bytes.len());
     f32x8::from([
         bytes[0] as i8 as f32,
         bytes[1] as i8 as f32,
@@ -572,5 +572,49 @@ mod tests {
             BackendError::InvalidInput { op, .. } => assert_eq!(op, "MatmulQuant"),
             other => panic!("expected InvalidInput, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn read_f16_decodes_known_bit_pattern() {
+        // f16 1.5 = 0x3E00, little-endian bytes [0x00, 0x3E].
+        assert_eq!(read_f16(&[0x00, 0x3e]), 1.5);
+    }
+
+    #[test]
+    #[should_panic(expected = "expected 2 bytes")]
+    fn read_f16_panics_on_wrong_length() {
+        // Was a debug_assert_eq!, compiled out in release: every call
+        // site slices exactly 2 bytes today, but a caller passing a
+        // longer slice would have silently used only the first 2 bytes.
+        read_f16(&[0x00, 0x3e, 0xff]);
+    }
+
+    #[test]
+    fn nibbles_f32x8_extracts_low_and_high_nibbles() {
+        let bytes = [0x1F, 0x2E, 0x00, 0xFF, 0x10, 0x01, 0xAB, 0xCD];
+        let low = nibbles_f32x8(&bytes, 0).to_array();
+        assert_eq!(low, [15.0, 14.0, 0.0, 15.0, 0.0, 1.0, 11.0, 13.0]);
+        let high = nibbles_f32x8(&bytes, 4).to_array();
+        assert_eq!(high, [1.0, 2.0, 0.0, 15.0, 1.0, 0.0, 10.0, 12.0]);
+    }
+
+    #[test]
+    #[should_panic(expected = "expected 8 bytes")]
+    fn nibbles_f32x8_panics_on_wrong_length() {
+        nibbles_f32x8(&[0u8; 7], 0);
+    }
+
+    #[test]
+    fn i8_bytes_f32x8_sign_extends_negative_bytes() {
+        // -1i8 and -128i8 as raw bytes, mixed with positive values.
+        let bytes = [0x00, 0x01, 0x7F, 0xFF, 0x80, 0xFE, 0x02, 0x03];
+        let got = i8_bytes_f32x8(&bytes).to_array();
+        assert_eq!(got, [0.0, 1.0, 127.0, -1.0, -128.0, -2.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    #[should_panic(expected = "expected 8 bytes")]
+    fn i8_bytes_f32x8_panics_on_wrong_length() {
+        i8_bytes_f32x8(&[0u8; 9]);
     }
 }

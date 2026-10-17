@@ -148,7 +148,14 @@ fn render_minimal_jinja(
     while let Some(start) = rest.find("{%") {
         let prefix = &rest[..start];
         out.push_str(prefix);
-        let tag_end = rest.find("%}").unwrap_or(rest.len());
+        let Some(tag_end) = rest.find("%}") else {
+            // Unterminated `{%` with no closing `%}` anywhere after it:
+            // treat the remainder as literal text instead of slicing past
+            // the end of `rest`.
+            out.push_str(&rest[start..]);
+            rest = "";
+            break;
+        };
         let tag = rest[start..tag_end + 2].trim();
         // Strip trim markers
         let tag_body = tag
@@ -259,5 +266,34 @@ mod tests {
     fn apply_dispatch() {
         let s = apply_chat_template(Some("chatml"), None, &msgs(), true);
         assert!(s.contains("<|im_start|>"));
+    }
+
+    #[test]
+    fn minimal_jinja_for_and_if() {
+        let tpl = "{%- for m in messages -%}[{{ m.role }}:{{ m.content }}]{%- endfor -%}{%- if add_generation_prompt -%}<gen>{%- endif -%}";
+        let s = render_minimal_jinja(tpl, &msgs(), true);
+        assert_eq!(s, "[user:hi][assistant:hello!]<gen>");
+    }
+
+    #[test]
+    fn minimal_jinja_if_false_omits_body() {
+        let tpl = "before{%- if add_generation_prompt -%}<gen>{%- endif -%}after";
+        let s = render_minimal_jinja(tpl, &msgs(), false);
+        assert_eq!(s, "beforeafter");
+    }
+
+    #[test]
+    fn minimal_jinja_unterminated_tag_does_not_panic() {
+        // A `{%` with no matching `%}` anywhere after it (a malformed or
+        // truncated chat_template pulled from a foreign .model file) used
+        // to slice `rest[start..rest.len() + 2]`, an out-of-bounds panic.
+        let s = render_minimal_jinja("hello {% if broken", &msgs(), false);
+        assert_eq!(s, "hello {% if broken");
+    }
+
+    #[test]
+    fn minimal_jinja_plain_text_passthrough() {
+        let s = render_minimal_jinja("just plain text, no tags", &msgs(), false);
+        assert_eq!(s, "just plain text, no tags");
     }
 }
